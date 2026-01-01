@@ -164,7 +164,13 @@ test "clear removes entries" {
 
 test "evicts oldest when over weight" {
     const alloc = std.testing.allocator;
-    const cfg = Config{ .shards = 2, .max_weight = 30, .items_to_prune = 10, .sample_size = 1024 };
+    const cfg = Config{
+        .shards = 2,
+        .max_weight = 30,
+        .items_to_prune = 10,
+        .sample_size = 1024,
+        .eviction_policy = .sampled_lru,
+    };
 
     var cache = try Cache(u64).init(alloc, cfg);
     defer cache.deinit();

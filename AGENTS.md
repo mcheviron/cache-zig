@@ -56,6 +56,13 @@ This directory is the Zig implementation of the cache.
 - Keep shard lock hold-times minimal.
 - Don’t call user-provided callbacks while holding shard locks.
 
+## Testing philosophy (TDD)
+
+This repo is **test-driven**:
+
+- Every feature/change must come with tests that validate the behavior and the hypothesis behind the change.
+- Prefer writing a failing test first, then implementing the smallest change to pass.
+
 ## Tests
 
 - Add tests for semantic changes (TTL, eviction policy, weight behavior).

@@ -2,7 +2,6 @@ const std = @import("std");
 
 /// Cache configuration.
 ///
-/// Config is a plain struct (no builder pattern). Set fields directly.
 /// Call `build()` to validate/normalize.
 ///
 /// `build()` performs no allocations.
