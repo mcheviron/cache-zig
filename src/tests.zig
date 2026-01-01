@@ -42,6 +42,33 @@ test "delete missing returns null" {
     try std.testing.expect(cache.delete("missing") == null);
 }
 
+test "extend missing returns false" {
+    const alloc = std.testing.allocator;
+    var cache = try Cache(u8).init(alloc, Config{ .max_weight = 10_000 });
+    defer cache.deinit();
+
+    try std.testing.expect(!cache.extend("missing", 1 * std.time.ns_per_s));
+}
+
+test "extend updates ttl" {
+    const alloc = std.testing.allocator;
+    var cache = try Cache(u8).init(alloc, Config{ .max_weight = 10_000 });
+    defer cache.deinit();
+
+    {
+        var a = try cache.set("a", 1, 1 * std.time.ns_per_ms);
+        defer a.deinit();
+    }
+
+    std.Thread.sleep(5 * std.time.ns_per_ms);
+
+    try std.testing.expect(cache.extend("a", 60 * std.time.ns_per_s));
+
+    var got = (cache.get("a") orelse return error.Miss);
+    defer got.deinit();
+    try std.testing.expect(!got.isExpired());
+}
+
 test "get returns expired item" {
     const alloc = std.testing.allocator;
     var cache = try Cache(u8).init(alloc, Config{ .max_weight = 10_000 });

@@ -194,6 +194,31 @@ pub fn Cache(comptime V: type) type {
             self.total_weight.store(0, .release);
         }
 
+        pub fn itemCount(self: *Self) usize {
+            var n: usize = 0;
+            for (self.shards) |*s| {
+                n += s.len();
+            }
+            return n;
+        }
+
+        pub fn len(self: *Self) usize {
+            return self.itemCount();
+        }
+
+        pub fn isEmpty(self: *Self) bool {
+            return self.len() == 0;
+        }
+
+        /// Extend an item TTL. Returns `false` if missing.
+        pub fn extend(self: *Self, key: []const u8, ttl_ns: u64) bool {
+            const ref = self.peek(key) orelse return false;
+            defer ref.deinit();
+
+            ref.extend(ttl_ns);
+            return true;
+        }
+
         pub fn snapshot(self: *Self, allocator: std.mem.Allocator) !std.ArrayList(ItemRef) {
             var list: std.ArrayList(ItemRef) = .empty;
 
@@ -251,16 +276,8 @@ pub fn Cache(comptime V: type) type {
             return x;
         }
 
-        fn itemCount(self: *Self) usize {
-            var n: usize = 0;
-            for (self.shards) |*s| {
-                n += s.len();
-            }
-            return n;
-        }
-
         fn pickEvictionCandidate(self: *Self) ?*Item {
-            if (self.itemCount() <= self.config.sample_size) {
+            if (self.len() <= self.config.sample_size) {
                 return self.scanOldest();
             }
 
