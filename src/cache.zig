@@ -4,7 +4,7 @@ const Config = @import("config.zig").Config;
 const ItemMod = @import("item.zig");
 const ShardMod = @import("shard.zig");
 
-fn shardIndex(key: []const u8, mask: usize) usize {
+fn _shardIndex(key: []const u8, mask: usize) usize {
     var h = std.hash.Fnv1a_64.init();
     h.update(key);
     const digest = h.final();
@@ -21,13 +21,14 @@ fn shardIndex(key: []const u8, mask: usize) usize {
 ///
 /// TTL note:
 ///
-/// Expiration is not enforced automatically; `get`/`peek` may return expired
-/// items.
+/// By default, expired items are treated as cache misses.
+/// Set `Config.treat_expired_as_miss=false` to allow `get`/`peek` to return
+/// expired items.
 ///
 /// Eviction:
 ///
 /// When the cache exceeds `Config.max_weight`, eviction samples candidates
-/// across shards and evicts the item with the oldest access tick.
+/// across shards and evicts using the configured eviction policy.
 pub fn Cache(comptime V: type) type {
     return struct {
         const Self = @This();
@@ -69,13 +70,13 @@ pub fn Cache(comptime V: type) type {
                 }
 
                 const Gen = struct {
-                    fn call(ctx: *anyopaque, item: *Item) bool {
+                    fn _call(ctx: *anyopaque, item: *Item) bool {
                         const self_ptr: T = @ptrCast(@alignCast(ctx));
                         return ti.pointer.child.pred(self_ptr, item);
                     }
                 };
 
-                return .{ .ctx = ptr, .callFn = Gen.call };
+                return .{ .ctx = ptr, .callFn = Gen._call };
             }
         };
 
@@ -170,13 +171,18 @@ pub fn Cache(comptime V: type) type {
 
         /// Get an item and update its access metadata.
         pub fn get(self: *Self, key: []const u8) ?ItemRef {
-            const shard = &self.shards[shardIndex(key, self.shard_mask)];
+            const shard = &self.shards[_shardIndex(key, self.shard_mask)];
             const item = shard.get(key) orelse return null;
 
             item.retain();
 
+            if (self.config.treat_expired_as_miss and item.isExpired()) {
+                item.release(self.allocator);
+                return null;
+            }
+
             if (item.isLive() and !item.isExpired()) {
-                item.touch(self.nextTick());
+                item.recordHit(self.nextTick());
             }
 
             return .{ .item = item, .allocator = self.allocator };
@@ -184,9 +190,15 @@ pub fn Cache(comptime V: type) type {
 
         /// Get an item without updating access metadata.
         pub fn peek(self: *Self, key: []const u8) ?ItemRef {
-            const shard = &self.shards[shardIndex(key, self.shard_mask)];
+            const shard = &self.shards[_shardIndex(key, self.shard_mask)];
             const item = shard.get(key) orelse return null;
             item.retain();
+
+            if (self.config.treat_expired_as_miss and item.isExpired()) {
+                item.release(self.allocator);
+                return null;
+            }
+
             return .{ .item = item, .allocator = self.allocator };
         }
 
@@ -194,12 +206,14 @@ pub fn Cache(comptime V: type) type {
         pub fn set(self: *Self, key: []const u8, value: V, ttl_ns: u64) !ItemRef {
             const weight = self.weigh(key, &value);
             const item = try Item.create(self.allocator, key, value, ttl_ns, weight);
-            item.touch(self.nextTick());
+            const tick = self.nextTick();
+            item.setCreatedTick(tick);
+            item.touch(tick);
 
             // Shard owns one ref.
             item.retain();
 
-            const shard = &self.shards[shardIndex(key, self.shard_mask)];
+            const shard = &self.shards[_shardIndex(key, self.shard_mask)];
             if (try shard.set(self.allocator, item.key, item)) |old| {
                 old.markDead();
                 _ = self.total_weight.fetchSub(old.weight, .acq_rel);
@@ -216,7 +230,7 @@ pub fn Cache(comptime V: type) type {
         /// Replace a value while preserving TTL.
         /// Returns null if the key does not exist.
         pub fn replace(self: *Self, key: []const u8, value: V) !?ItemRef {
-            const existing = self.peek(key) orelse return null;
+            const existing = self._peekRaw(key) orelse return null;
             defer existing.deinit();
 
             const ttl = existing.ttlNs();
@@ -226,7 +240,7 @@ pub fn Cache(comptime V: type) type {
         /// Delete a key and return the removed item.
         /// Returns null if missing.
         pub fn delete(self: *Self, key: []const u8) ?ItemRef {
-            const shard = &self.shards[shardIndex(key, self.shard_mask)];
+            const shard = &self.shards[_shardIndex(key, self.shard_mask)];
             const item = shard.delete(self.allocator, key) orelse return null;
 
             item.markDead();
@@ -265,11 +279,19 @@ pub fn Cache(comptime V: type) type {
 
         /// Extend an item TTL. Returns `false` if missing.
         pub fn extend(self: *Self, key: []const u8, ttl_ns: u64) bool {
-            const ref = self.peek(key) orelse return false;
+            const ref = self._peekRaw(key) orelse return false;
             defer ref.deinit();
 
             ref.extend(ttl_ns);
+            ref.item.touch(self.nextTick());
             return true;
+        }
+
+        fn _peekRaw(self: *Self, key: []const u8) ?ItemRef {
+            const shard = &self.shards[_shardIndex(key, self.shard_mask)];
+            const item = shard.get(key) orelse return null;
+            item.retain();
+            return .{ .item = item, .allocator = self.allocator };
         }
 
         /// Snapshot all items.
@@ -335,9 +357,19 @@ pub fn Cache(comptime V: type) type {
 
         fn pickEvictionCandidate(self: *Self) ?*Item {
             if (self.len() <= self.config.sample_size) {
-                return self.scanOldest();
+                return switch (self.config.eviction_policy) {
+                    .sampled_lhd => self.scanLeastHitDense(),
+                    else => self.scanOldest(),
+                };
             }
 
+            return switch (self.config.eviction_policy) {
+                .sampled_lhd => self.pickSampledLhd() orelse self.scanLeastHitDense(),
+                else => self.pickSampledLru() orelse self.scanOldest(),
+            };
+        }
+
+        fn pickSampledLru(self: *Self) ?*Item {
             var best: ?*Item = null;
             var best_tick: u64 = std.math.maxInt(u64);
 
@@ -356,7 +388,7 @@ pub fn Cache(comptime V: type) type {
                 }
             }
 
-            return best orelse self.scanOldest();
+            return best;
         }
 
         fn scanOldest(self: *Self) ?*Item {
@@ -380,6 +412,74 @@ pub fn Cache(comptime V: type) type {
             return best;
         }
 
+        fn pickSampledLhd(self: *Self) ?*Item {
+            const now_tick = @max(self.access_clock.load(.acquire), 1);
+
+            var best: ?*Item = null;
+
+            var i: usize = 0;
+            while (i < self.config.sample_size) : (i += 1) {
+                const shard = &self.shards[self.nextRand() % self.shards.len];
+                const item = shard.sampleAtRetained(@intCast(self.nextRand())) orelse continue;
+
+                if (best == null or self.lhdIsBetterCandidate(item, best.?, now_tick)) {
+                    if (best) |b| b.release(self.allocator);
+                    best = item;
+                } else {
+                    item.release(self.allocator);
+                }
+            }
+
+            return best;
+        }
+
+        fn scanLeastHitDense(self: *Self) ?*Item {
+            const now_tick = @max(self.access_clock.load(.acquire), 1);
+            var best: ?*Item = null;
+
+            for (self.shards) |*shard| {
+                shard.lock.lockShared();
+                for (shard.items.items) |item| {
+                    if (best == null or self.lhdIsBetterCandidate(item, best.?, now_tick)) {
+                        item.retain();
+                        if (best) |b| b.release(self.allocator);
+                        best = item;
+                    }
+                }
+                shard.lock.unlockShared();
+            }
+
+            return best;
+        }
+
+        fn lhdIsBetterCandidate(self: *Self, candidate: *Item, current: *Item, now_tick: u64) bool {
+            _ = self;
+
+            const cand_hits, const cand_denom = lhdStats(candidate, now_tick);
+            const cur_hits, const cur_denom = lhdStats(current, now_tick);
+
+            const cand_lhs: u128 = @as(u128, cand_hits) * cur_denom;
+            const cur_lhs: u128 = @as(u128, cur_hits) * cand_denom;
+
+            if (cand_lhs != cur_lhs) {
+                return cand_lhs < cur_lhs;
+            }
+
+            if (candidate.weight != current.weight) {
+                return candidate.weight > current.weight;
+            }
+
+            return candidate.lastAccess() < current.lastAccess();
+        }
+
+        fn lhdStats(item: *Item, now_tick: u64) struct { u64, u128 } {
+            const created = item.createdTick();
+            const age: u64 = @max(now_tick -| created, 1);
+            const weight: u128 = @max(@as(u128, item.weight), 1);
+            const denom: u128 = @as(u128, age) * weight;
+            return .{ item.hitCount(), @max(denom, 1) };
+        }
+
         fn evictIfNeeded(self: *Self) !void {
             var evicted: usize = 0;
             while (self.total_weight.load(.acquire) > self.config.max_weight and evicted < self.config.items_to_prune) {
@@ -388,7 +488,7 @@ pub fn Cache(comptime V: type) type {
 
                 candidate.markDead();
 
-                const shard = &self.shards[shardIndex(candidate.key, self.shard_mask)];
+                const shard = &self.shards[_shardIndex(candidate.key, self.shard_mask)];
                 if (shard.deleteIfSame(self.allocator, candidate.key, candidate)) |removed| {
                     _ = self.total_weight.fetchSub(removed.weight, .acq_rel);
                     removed.release(self.allocator); // drop shard ref

@@ -3,7 +3,7 @@
 //! Key properties:
 //!
 //! - Sharded key/value storage for concurrent access.
-//! - TTL stored per item (expiration is not automatically enforced on `get`).
+//! - TTL stored per item (expired entries are treated as misses by default).
 //! - Size-based eviction using sampled-by-access eviction.
 //!   When over `Config.max_weight`, the cache samples candidates across shards
 //!   and evicts the item with the oldest access tick.

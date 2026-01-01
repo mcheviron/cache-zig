@@ -7,6 +7,11 @@ const std = @import("std");
 ///
 /// `build()` performs no allocations.
 pub const Config = struct {
+    pub const EvictionPolicy = enum {
+        sampled_lru,
+        sampled_lhd,
+    };
+
     /// Number of shards; must be a power of two.
     shards: usize = 16,
 
@@ -18,6 +23,11 @@ pub const Config = struct {
 
     /// Number of candidates sampled per eviction.
     sample_size: usize = 32,
+
+    eviction_policy: EvictionPolicy = .sampled_lru,
+
+    /// If true (default), expired items are treated as cache misses.
+    treat_expired_as_miss: bool = true,
 
     pub const BuildError = error{InvalidConfig};
 

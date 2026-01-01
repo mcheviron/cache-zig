@@ -69,7 +69,7 @@ test "extend updates ttl" {
     try std.testing.expect(!got.isExpired());
 }
 
-test "get returns expired item" {
+test "get expired is miss by default" {
     const alloc = std.testing.allocator;
     var cache = try Cache(u8).init(alloc, Config{ .max_weight = 10_000 });
     defer cache.deinit();
@@ -79,9 +79,7 @@ test "get returns expired item" {
 
     std.Thread.sleep(5 * std.time.ns_per_ms);
 
-    var got = (cache.get("a") orelse return error.Miss);
-    defer got.deinit();
-    try std.testing.expect(got.isExpired());
+    try std.testing.expect(cache.get("a") == null);
 }
 
 test "replace preserves ttl" {
@@ -190,4 +188,55 @@ test "evicts oldest when over weight" {
     }
 
     try std.testing.expect(cache.peek("k1") == null);
+}
+
+test "evicts least hit dense when over weight" {
+    const alloc = std.testing.allocator;
+
+    const W = struct {
+        pub fn weigh(_: *@This(), _: []const u8, _: *const u64) usize {
+            return 10;
+        }
+    };
+
+    const Gen = struct {
+        fn call(ctx: *anyopaque, key: []const u8, value: *const u64) usize {
+            const w: *W = @ptrCast(@alignCast(ctx));
+            return w.weigh(key, value);
+        }
+    };
+
+    var w = W{};
+    const weigher = Cache(u64).Weigher{ .ctx = &w, .callFn = Gen.call };
+
+    const cfg = Config{
+        .shards = 2,
+        .max_weight = 20,
+        .items_to_prune = 10,
+        .sample_size = 1024,
+        .eviction_policy = .sampled_lhd,
+    };
+
+    var cache = try Cache(u64).initWithWeigher(alloc, cfg, weigher);
+    defer cache.deinit();
+
+    {
+        var k1 = try cache.set("k1", 1, 60 * std.time.ns_per_s);
+        defer k1.deinit();
+        var k2 = try cache.set("k2", 2, 60 * std.time.ns_per_s);
+        defer k2.deinit();
+    }
+
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        var k1 = cache.get("k1") orelse return error.Miss;
+        k1.deinit();
+    }
+
+    {
+        var k3 = try cache.set("k3", 3, 60 * std.time.ns_per_s);
+        defer k3.deinit();
+    }
+
+    try std.testing.expect(cache.peek("k2") == null);
 }
