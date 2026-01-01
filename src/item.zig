@@ -119,18 +119,22 @@ pub fn Item(comptime V: type) type {
             self.expires_at_ns.store(_addTtl(_nowNs(), ttl_ns), .release);
         }
 
+        /// Set the creation tick (used for hit-density eviction).
         pub fn setCreatedTick(self: *Self, tick: u64) void {
             self.created_tick.store(tick, .release);
         }
 
+        /// Read the creation tick.
         pub fn createdTick(self: *Self) u64 {
             return self.created_tick.load(.acquire);
         }
 
+        /// Number of successful hits recorded for this item.
         pub fn hitCount(self: *Self) u64 {
             return self.hits.load(.acquire);
         }
 
+        /// Record a cache hit and update last access tick.
         pub fn recordHit(self: *Self, tick: u64) void {
             _ = self.hits.fetchAdd(1, .acq_rel);
             self.touch(tick);

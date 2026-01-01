@@ -40,20 +40,61 @@ pub fn Cache(comptime V: type) type {
         /// Optional weight function.
         ///
         /// If provided, this controls the weight used for eviction.
+        ///
+        /// # Example
+        ///
+        /// ```zig
+        /// const cache_zig = @import("cache_zig");
+        ///
+        /// const W = struct {
+        ///     pub fn weigh(_: *@This(), _: []const u8, _: *const u64) usize {
+        ///         return 10;
+        ///     }
+        /// };
+        ///
+        /// const Gen = struct {
+        ///     fn call(ctx: *anyopaque, key: []const u8, value: *const u64) usize {
+        ///         const w: *W = @ptrCast(@alignCast(ctx));
+        ///         return w.weigh(key, value);
+        ///     }
+        /// };
+        ///
+        /// var w = W{};
+        /// const weigher = cache_zig.Cache(u64).Weigher{ .ctx = &w, .callFn = Gen.call };
+        /// _ = weigher;
+        /// ```
         pub const Weigher = struct {
             ctx: *anyopaque,
             callFn: *const fn (ctx: *anyopaque, key: []const u8, value: *const V) usize,
 
+            /// Call the weigher.
             pub fn call(self: Weigher, key: []const u8, value: *const V) usize {
                 return self.callFn(self.ctx, key, value);
             }
         };
 
         /// Predicate interface for `filter`.
+        ///
+        /// # Example
+        ///
+        /// ```zig
+        /// const cache_zig = @import("cache_zig");
+        ///
+        /// const Pred = struct {
+        ///     pub fn pred(_: *@This(), item: *cache_zig.Cache(u64).Item) bool {
+        ///         return item.value == 1;
+        ///     }
+        /// };
+        ///
+        /// var p = Pred{};
+        /// const pred = cache_zig.Cache(u64).ItemPredicate.init(&p);
+        /// _ = pred;
+        /// ```
         pub const ItemPredicate = struct {
             ctx: *anyopaque,
             callFn: *const fn (ctx: *anyopaque, item: *Item) bool,
 
+            /// Invoke the predicate.
             pub fn call(self: ItemPredicate, item: *Item) bool {
                 return self.callFn(self.ctx, item);
             }
@@ -90,31 +131,118 @@ pub fn Cache(comptime V: type) type {
             allocator: std.mem.Allocator,
 
             /// Release this reference.
+            ///
+            /// Always call this (usually via `defer ref.deinit()`).
             pub fn deinit(self: ItemRef) void {
                 self.item.release(self.allocator);
             }
 
             /// Get the key bytes.
+            ///
+            /// # Example
+            ///
+            /// ```zig
+            /// const std = @import("std");
+            /// const cache_zig = @import("cache_zig");
+            ///
+            /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
+            /// defer cache.deinit();
+            ///
+            /// var set_ref = try cache.set("k", 1, 60 * std.time.ns_per_s);
+            /// defer set_ref.deinit();
+            ///
+            /// var ref = cache.get("k") orelse return error.Miss;
+            /// defer ref.deinit();
+            /// try std.testing.expectEqualStrings("k", ref.key());
+            /// ```
             pub fn key(self: ItemRef) []const u8 {
                 return self.item.key;
             }
 
             /// Get a pointer to the stored value.
+            ///
+            /// # Example
+            ///
+            /// ```zig
+            /// const std = @import("std");
+            /// const cache_zig = @import("cache_zig");
+            ///
+            /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
+            /// defer cache.deinit();
+            ///
+            /// var set_ref = try cache.set("k", 123, 60 * std.time.ns_per_s);
+            /// defer set_ref.deinit();
+            ///
+            /// var ref = cache.get("k") orelse return error.Miss;
+            /// defer ref.deinit();
+            /// try std.testing.expectEqual(@as(u64, 123), ref.value().*);
+            /// ```
             pub fn value(self: ItemRef) *const V {
                 return &self.item.value;
             }
 
             /// Whether this item is expired.
+            ///
+            /// # Example
+            ///
+            /// ```zig
+            /// const std = @import("std");
+            /// const cache_zig = @import("cache_zig");
+            ///
+            /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
+            /// defer cache.deinit();
+            ///
+            /// var set_ref = try cache.set("k", 1, 1);
+            /// defer set_ref.deinit();
+            ///
+            /// var ref = cache.peek("k") orelse return error.Miss;
+            /// defer ref.deinit();
+            /// _ = ref.isExpired();
+            /// ```
             pub fn isExpired(self: ItemRef) bool {
                 return self.item.isExpired();
             }
 
             /// Remaining TTL in nanoseconds.
+            ///
+            /// # Example
+            ///
+            /// ```zig
+            /// const std = @import("std");
+            /// const cache_zig = @import("cache_zig");
+            ///
+            /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
+            /// defer cache.deinit();
+            ///
+            /// var set_ref = try cache.set("k", 1, 60 * std.time.ns_per_s);
+            /// defer set_ref.deinit();
+            ///
+            /// var ref = cache.peek("k") orelse return error.Miss;
+            /// defer ref.deinit();
+            /// try std.testing.expect(ref.ttlNs() > 0);
+            /// ```
             pub fn ttlNs(self: ItemRef) u64 {
                 return self.item.ttlNs();
             }
 
             /// Extend TTL (sets expiration to now + ttl_ns).
+            ///
+            /// # Example
+            ///
+            /// ```zig
+            /// const std = @import("std");
+            /// const cache_zig = @import("cache_zig");
+            ///
+            /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
+            /// defer cache.deinit();
+            ///
+            /// var set_ref = try cache.set("k", 1, 1);
+            /// defer set_ref.deinit();
+            ///
+            /// var ref = cache.peek("k") orelse return error.Miss;
+            /// defer ref.deinit();
+            /// ref.extend(60 * std.time.ns_per_s);
+            /// ```
             pub fn extend(self: ItemRef, ttl_ns: u64) void {
                 self.item.extend(ttl_ns);
             }
@@ -132,6 +260,18 @@ pub fn Cache(comptime V: type) type {
         weigher: ?Weigher,
 
         /// Initialize a cache.
+        ///
+        /// `config_in.build()` is called internally.
+        ///
+        /// # Example
+        ///
+        /// ```zig
+        /// const std = @import("std");
+        /// const cache_zig = @import("cache_zig");
+        ///
+        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
+        /// defer cache.deinit();
+        /// ```
         pub fn init(allocator: std.mem.Allocator, config_in: Config) !Self {
             const cfg = try config_in.build();
             const shards = try allocator.alloc(Shard, cfg.shards);
@@ -147,6 +287,32 @@ pub fn Cache(comptime V: type) type {
         }
 
         /// Initialize a cache with a custom weigher.
+        ///
+        /// # Example
+        ///
+        /// ```zig
+        /// const std = @import("std");
+        /// const cache_zig = @import("cache_zig");
+        ///
+        /// const W = struct {
+        ///     pub fn weigh(_: *@This(), _: []const u8, _: *const u64) usize {
+        ///         return 10;
+        ///     }
+        /// };
+        ///
+        /// const Gen = struct {
+        ///     fn call(ctx: *anyopaque, key: []const u8, value: *const u64) usize {
+        ///         const w: *W = @ptrCast(@alignCast(ctx));
+        ///         return w.weigh(key, value);
+        ///     }
+        /// };
+        ///
+        /// var w = W{};
+        /// const weigher = cache_zig.Cache(u64).Weigher{ .ctx = &w, .callFn = Gen.call };
+        ///
+        /// var cache = try cache_zig.Cache(u64).initWithWeigher(std.testing.allocator, .{}, weigher);
+        /// defer cache.deinit();
+        /// ```
         pub fn initWithWeigher(allocator: std.mem.Allocator, config_in: Config, weigher: Weigher) !Self {
             var c = try Self.init(allocator, config_in);
             c.weigher = weigher;
@@ -154,6 +320,18 @@ pub fn Cache(comptime V: type) type {
         }
 
         /// Deinitialize the cache and free all items.
+        ///
+        /// After calling `deinit`, all `ItemRef`s that still exist are invalid.
+        ///
+        /// # Example
+        ///
+        /// ```zig
+        /// const std = @import("std");
+        /// const cache_zig = @import("cache_zig");
+        ///
+        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
+        /// cache.deinit();
+        /// ```
         pub fn deinit(self: *Self) void {
             for (self.shards) |*shard| {
                 shard.lock.lock();
@@ -170,6 +348,26 @@ pub fn Cache(comptime V: type) type {
         }
 
         /// Get an item and update its access metadata.
+        ///
+        /// Returns `null` on miss (including expired entries when
+        /// `Config.treat_expired_as_miss=true`).
+        ///
+        /// # Example
+        ///
+        /// ```zig
+        /// const std = @import("std");
+        /// const cache_zig = @import("cache_zig");
+        ///
+        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
+        /// defer cache.deinit();
+        ///
+        /// var set_ref = try cache.set("k", 1, 60 * std.time.ns_per_s);
+        /// defer set_ref.deinit();
+        ///
+        /// var ref = cache.get("k") orelse return error.Miss;
+        /// defer ref.deinit();
+        /// _ = ref;
+        /// ```
         pub fn get(self: *Self, key: []const u8) ?ItemRef {
             const shard = &self.shards[_shardIndex(key, self.shard_mask)];
             const item = shard.get(key) orelse return null;
@@ -189,6 +387,23 @@ pub fn Cache(comptime V: type) type {
         }
 
         /// Get an item without updating access metadata.
+        ///
+        /// # Example
+        ///
+        /// ```zig
+        /// const std = @import("std");
+        /// const cache_zig = @import("cache_zig");
+        ///
+        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
+        /// defer cache.deinit();
+        ///
+        /// var set_ref = try cache.set("k", 1, 60 * std.time.ns_per_s);
+        /// defer set_ref.deinit();
+        ///
+        /// var ref = cache.peek("k") orelse return error.Miss;
+        /// defer ref.deinit();
+        /// _ = ref;
+        /// ```
         pub fn peek(self: *Self, key: []const u8) ?ItemRef {
             const shard = &self.shards[_shardIndex(key, self.shard_mask)];
             const item = shard.get(key) orelse return null;
@@ -203,6 +418,23 @@ pub fn Cache(comptime V: type) type {
         }
 
         /// Insert or update a key/value with TTL (in nanoseconds).
+        ///
+        /// Returns an `ItemRef` pointing at the stored value. This does not remove
+        /// the item from the cache.
+        ///
+        /// # Example
+        ///
+        /// ```zig
+        /// const std = @import("std");
+        /// const cache_zig = @import("cache_zig");
+        ///
+        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
+        /// defer cache.deinit();
+        ///
+        /// var ref = try cache.set("k", 123, 1 * std.time.ns_per_s);
+        /// defer ref.deinit();
+        /// try std.testing.expectEqual(@as(u64, 123), ref.value().*);
+        /// ```
         pub fn set(self: *Self, key: []const u8, value: V, ttl_ns: u64) !ItemRef {
             const weight = self.weigh(key, &value);
             const item = try Item.create(self.allocator, key, value, ttl_ns, weight);
@@ -229,6 +461,23 @@ pub fn Cache(comptime V: type) type {
 
         /// Replace a value while preserving TTL.
         /// Returns null if the key does not exist.
+        ///
+        /// # Example
+        ///
+        /// ```zig
+        /// const std = @import("std");
+        /// const cache_zig = @import("cache_zig");
+        ///
+        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
+        /// defer cache.deinit();
+        ///
+        /// var set_ref = try cache.set("k", 1, 60 * std.time.ns_per_s);
+        /// defer set_ref.deinit();
+        ///
+        /// const replaced = try cache.replace("k", 2) orelse return error.Miss;
+        /// defer replaced.deinit();
+        /// try std.testing.expectEqual(@as(u64, 2), replaced.value().*);
+        /// ```
         pub fn replace(self: *Self, key: []const u8, value: V) !?ItemRef {
             const existing = self._peekRaw(key) orelse return null;
             defer existing.deinit();
@@ -239,6 +488,25 @@ pub fn Cache(comptime V: type) type {
 
         /// Delete a key and return the removed item.
         /// Returns null if missing.
+        ///
+        /// The returned `ItemRef` holds the removed value until `deinit()`.
+        ///
+        /// # Example
+        ///
+        /// ```zig
+        /// const std = @import("std");
+        /// const cache_zig = @import("cache_zig");
+        ///
+        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
+        /// defer cache.deinit();
+        ///
+        /// var set_ref = try cache.set("k", 1, 60 * std.time.ns_per_s);
+        /// defer set_ref.deinit();
+        ///
+        /// var deleted = cache.delete("k") orelse return error.Miss;
+        /// defer deleted.deinit();
+        /// try std.testing.expect(cache.peek("k") == null);
+        /// ```
         pub fn delete(self: *Self, key: []const u8) ?ItemRef {
             const shard = &self.shards[_shardIndex(key, self.shard_mask)];
             const item = shard.delete(self.allocator, key) orelse return null;
@@ -251,6 +519,19 @@ pub fn Cache(comptime V: type) type {
         }
 
         /// Clear all items.
+        ///
+        /// # Example
+        ///
+        /// ```zig
+        /// const std = @import("std");
+        /// const cache_zig = @import("cache_zig");
+        ///
+        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
+        /// defer cache.deinit();
+        ///
+        /// cache.clear();
+        /// try std.testing.expect(cache.isEmpty());
+        /// ```
         pub fn clear(self: *Self) void {
             for (self.shards) |*shard| {
                 shard.clear(self.allocator);
@@ -259,6 +540,18 @@ pub fn Cache(comptime V: type) type {
         }
 
         /// Count of stored items.
+        ///
+        /// # Example
+        ///
+        /// ```zig
+        /// const std = @import("std");
+        /// const cache_zig = @import("cache_zig");
+        ///
+        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
+        /// defer cache.deinit();
+        ///
+        /// try std.testing.expectEqual(@as(usize, 0), cache.itemCount());
+        /// ```
         pub fn itemCount(self: *Self) usize {
             var n: usize = 0;
             for (self.shards) |*s| {
@@ -268,16 +561,55 @@ pub fn Cache(comptime V: type) type {
         }
 
         /// Alias for itemCount.
+        ///
+        /// # Example
+        ///
+        /// ```zig
+        /// const std = @import("std");
+        /// const cache_zig = @import("cache_zig");
+        ///
+        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
+        /// defer cache.deinit();
+        /// try std.testing.expectEqual(cache.itemCount(), cache.len());
+        /// ```
         pub fn len(self: *Self) usize {
             return self.itemCount();
         }
 
         /// Whether cache is empty.
+        ///
+        /// # Example
+        ///
+        /// ```zig
+        /// const std = @import("std");
+        /// const cache_zig = @import("cache_zig");
+        ///
+        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
+        /// defer cache.deinit();
+        /// try std.testing.expect(cache.isEmpty());
+        /// ```
         pub fn isEmpty(self: *Self) bool {
             return self.len() == 0;
         }
 
         /// Extend an item TTL. Returns `false` if missing.
+        ///
+        /// This sets expiration to `now + ttl_ns`.
+        ///
+        /// # Example
+        ///
+        /// ```zig
+        /// const std = @import("std");
+        /// const cache_zig = @import("cache_zig");
+        ///
+        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
+        /// defer cache.deinit();
+        ///
+        /// var set_ref = try cache.set("k", 1, 1);
+        /// defer set_ref.deinit();
+        ///
+        /// try std.testing.expect(cache.extend("k", 60 * std.time.ns_per_s));
+        /// ```
         pub fn extend(self: *Self, key: []const u8, ttl_ns: u64) bool {
             const ref = self._peekRaw(key) orelse return false;
             defer ref.deinit();
@@ -297,6 +629,23 @@ pub fn Cache(comptime V: type) type {
         /// Snapshot all items.
         ///
         /// Returned ItemRefs must be deinit'd by the caller.
+        ///
+        /// # Example
+        ///
+        /// ```zig
+        /// const std = @import("std");
+        /// const cache_zig = @import("cache_zig");
+        ///
+        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
+        /// defer cache.deinit();
+        ///
+        /// var list = try cache.snapshot(std.testing.allocator);
+        /// defer {
+        ///     for (list.items) |ref| ref.deinit();
+        ///     list.deinit(std.testing.allocator);
+        /// }
+        /// _ = list;
+        /// ```
         pub fn snapshot(self: *Self, allocator: std.mem.Allocator) !std.ArrayList(ItemRef) {
             var list: std.ArrayList(ItemRef) = .empty;
 
@@ -316,6 +665,37 @@ pub fn Cache(comptime V: type) type {
         }
 
         /// Filter items by predicate.
+        ///
+        /// Returned ItemRefs must be deinit'd by the caller.
+        ///
+        /// # Example
+        ///
+        /// ```zig
+        /// const std = @import("std");
+        /// const cache_zig = @import("cache_zig");
+        ///
+        /// const Pred = struct {
+        ///     pub fn pred(_: *@This(), item: *cache_zig.Cache(u64).Item) bool {
+        ///         return item.value == 1;
+        ///     }
+        /// };
+        ///
+        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
+        /// defer cache.deinit();
+        ///
+        /// var a = try cache.set("a", 1, 60 * std.time.ns_per_s);
+        /// defer a.deinit();
+        /// var b = try cache.set("b", 2, 60 * std.time.ns_per_s);
+        /// defer b.deinit();
+        ///
+        /// var p = Pred{};
+        /// var list = try cache.filter(std.testing.allocator, cache_zig.Cache(u64).ItemPredicate.init(&p));
+        /// defer {
+        ///     for (list.items) |ref| ref.deinit();
+        ///     list.deinit(std.testing.allocator);
+        /// }
+        /// _ = list;
+        /// ```
         pub fn filter(self: *Self, allocator: std.mem.Allocator, pred: ItemPredicate) !std.ArrayList(ItemRef) {
             var list: std.ArrayList(ItemRef) = .empty;
 
