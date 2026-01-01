@@ -1,9 +1,14 @@
-//! `cache-zig`: sharded in-memory cache with TTL and LRU-ish eviction.
+//! `cache-zig`: sharded in-memory cache with TTL and size-based eviction.
 //!
-//! This is a Zig port of the `cache-rs` implementation:
-//! - Sharded key/value storage for concurrency.
-//! - Single worker thread maintaining global LRU ordering and evicting by weight.
+//! Key properties:
+//!
+//! - Sharded key/value storage for concurrent access.
 //! - TTL stored per item (expiration is not automatically enforced on `get`).
+//! - Size-based eviction using sampled-by-access eviction.
+//!   When over `Config.max_weight`, the cache samples candidates across shards
+//!   and evicts the item with the oldest access tick.
+//! - Optional `Cache(V).Weigher` for accurate weights.
+//!   If not provided, weight defaults to `key.len + @sizeOf(V)`.
 //!
 //! # Example
 //!
@@ -16,15 +21,28 @@
 //!     defer _ = gpa.deinit();
 //!     const alloc = gpa.allocator();
 //!
-//!     var cache = try cache_zig.Cache(u64).init(alloc, cache_zig.Config{});
+//!     var cfg = cache_zig.Config{ .max_weight = 10_000 };
+//!     var cache = try cache_zig.Cache(u64).init(alloc, cfg);
 //!     defer cache.deinit();
 //!
-//!     _ = try cache.set("k", 123, 60 * std.time.ns_per_s);
-//!     var item = (cache.get("k") orelse return error.Miss);
-//!     defer item.deinit();
-//!     try std.testing.expectEqual(@as(u64, 123), item.value().*);
+//!     // set/get return an ItemRef which must be deinit'd.
+//!     var set_ref = try cache.set("k", 123, 60 * std.time.ns_per_s);
+//!     defer set_ref.deinit();
+//!
+//!     var get_ref = cache.get("k") orelse return error.Miss;
+//!     defer get_ref.deinit();
+//!     try std.testing.expectEqual(@as(u64, 123), get_ref.value().*);
 //! }
 //! ```
+//!
+//! # ItemRef lifetime
+//!
+//! `Cache(V).ItemRef` is a reference-counted handle to the underlying item.
+//! Always `defer item_ref.deinit()`.
+//!
+//! - `get`/`peek`/`set` return an `ItemRef` that does NOT remove the item from the cache.
+//! - `delete` removes the key from the cache and returns an `ItemRef` for the removed item;
+//!   when the last `ItemRef` is deinit'd, the item memory is freed.
 
 const std = @import("std");
 

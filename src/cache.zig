@@ -11,13 +11,34 @@ fn shardIndex(key: []const u8, mask: usize) usize {
     return @as(usize, @intCast(digest)) & mask;
 }
 
+/// Construct a cache type specialized for value type `V`.
+///
+/// The cache stores items by string key (`[]const u8` in Zig terms) and a
+/// compile-time value type `V`.
+///
+/// Public methods return `ItemRef`, a reference-counted handle which must be
+/// `deinit()`'d by the caller.
+///
+/// TTL note:
+///
+/// Expiration is not enforced automatically; `get`/`peek` may return expired
+/// items.
+///
+/// Eviction:
+///
+/// When the cache exceeds `Config.max_weight`, eviction samples candidates
+/// across shards and evicts the item with the oldest access tick.
 pub fn Cache(comptime V: type) type {
     return struct {
         const Self = @This();
 
+        /// Internal item type.
         pub const Item = ItemMod.Item(V);
         const Shard = ShardMod.Shard(*Item);
 
+        /// Optional weight function.
+        ///
+        /// If provided, this controls the weight used for eviction.
         pub const Weigher = struct {
             ctx: *anyopaque,
             callFn: *const fn (ctx: *anyopaque, key: []const u8, value: *const V) usize,
@@ -27,6 +48,7 @@ pub fn Cache(comptime V: type) type {
             }
         };
 
+        /// Predicate interface for `filter`.
         pub const ItemPredicate = struct {
             ctx: *anyopaque,
             callFn: *const fn (ctx: *anyopaque, item: *Item) bool,
@@ -35,6 +57,10 @@ pub fn Cache(comptime V: type) type {
                 return self.callFn(self.ctx, item);
             }
 
+            /// Convenience initializer.
+            ///
+            /// Expects `ptr` to be a single-item pointer where the pointed-to type
+            /// declares `pub fn pred(self: <ptr type>, item: *Item) bool`.
             pub fn init(ptr: anytype) ItemPredicate {
                 const T = @TypeOf(ptr);
                 const ti = @typeInfo(T);
@@ -53,30 +79,41 @@ pub fn Cache(comptime V: type) type {
             }
         };
 
+        /// Handle to an item stored in the cache.
+        ///
+        /// This is a reference-counted handle. Always call `deinit()`.
+        /// Dropping an ItemRef does not delete the key from the cache; deletion
+        /// happens via `delete` or eviction.
         pub const ItemRef = struct {
             item: *Item,
             allocator: std.mem.Allocator,
 
+            /// Release this reference.
             pub fn deinit(self: ItemRef) void {
                 self.item.release(self.allocator);
             }
 
+            /// Get the key bytes.
             pub fn key(self: ItemRef) []const u8 {
                 return self.item.key;
             }
 
+            /// Get a pointer to the stored value.
             pub fn value(self: ItemRef) *const V {
                 return &self.item.value;
             }
 
+            /// Whether this item is expired.
             pub fn isExpired(self: ItemRef) bool {
                 return self.item.isExpired();
             }
 
+            /// Remaining TTL in nanoseconds.
             pub fn ttlNs(self: ItemRef) u64 {
                 return self.item.ttlNs();
             }
 
+            /// Extend TTL (sets expiration to now + ttl_ns).
             pub fn extend(self: ItemRef, ttl_ns: u64) void {
                 self.item.extend(ttl_ns);
             }
@@ -86,11 +123,14 @@ pub fn Cache(comptime V: type) type {
         config: Config,
         shard_mask: usize,
         shards: []Shard,
+
         access_clock: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
         total_weight: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
         rng_state: std.atomic.Value(u64) = std.atomic.Value(u64).init(0x9e3779b97f4a7c15),
+
         weigher: ?Weigher,
 
+        /// Initialize a cache.
         pub fn init(allocator: std.mem.Allocator, config_in: Config) !Self {
             const cfg = try config_in.build();
             const shards = try allocator.alloc(Shard, cfg.shards);
@@ -105,12 +145,14 @@ pub fn Cache(comptime V: type) type {
             };
         }
 
+        /// Initialize a cache with a custom weigher.
         pub fn initWithWeigher(allocator: std.mem.Allocator, config_in: Config, weigher: Weigher) !Self {
             var c = try Self.init(allocator, config_in);
             c.weigher = weigher;
             return c;
         }
 
+        /// Deinitialize the cache and free all items.
         pub fn deinit(self: *Self) void {
             for (self.shards) |*shard| {
                 shard.lock.lock();
@@ -126,6 +168,7 @@ pub fn Cache(comptime V: type) type {
             self.allocator.free(self.shards);
         }
 
+        /// Get an item and update its access metadata.
         pub fn get(self: *Self, key: []const u8) ?ItemRef {
             const shard = &self.shards[shardIndex(key, self.shard_mask)];
             const item = shard.get(key) orelse return null;
@@ -139,6 +182,7 @@ pub fn Cache(comptime V: type) type {
             return .{ .item = item, .allocator = self.allocator };
         }
 
+        /// Get an item without updating access metadata.
         pub fn peek(self: *Self, key: []const u8) ?ItemRef {
             const shard = &self.shards[shardIndex(key, self.shard_mask)];
             const item = shard.get(key) orelse return null;
@@ -146,6 +190,7 @@ pub fn Cache(comptime V: type) type {
             return .{ .item = item, .allocator = self.allocator };
         }
 
+        /// Insert or update a key/value with TTL (in nanoseconds).
         pub fn set(self: *Self, key: []const u8, value: V, ttl_ns: u64) !ItemRef {
             const weight = self.weigh(key, &value);
             const item = try Item.create(self.allocator, key, value, ttl_ns, weight);
@@ -168,6 +213,8 @@ pub fn Cache(comptime V: type) type {
             return .{ .item = item, .allocator = self.allocator };
         }
 
+        /// Replace a value while preserving TTL.
+        /// Returns null if the key does not exist.
         pub fn replace(self: *Self, key: []const u8, value: V) !?ItemRef {
             const existing = self.peek(key) orelse return null;
             defer existing.deinit();
@@ -176,6 +223,8 @@ pub fn Cache(comptime V: type) type {
             return try self.set(key, value, ttl);
         }
 
+        /// Delete a key and return the removed item.
+        /// Returns null if missing.
         pub fn delete(self: *Self, key: []const u8) ?ItemRef {
             const shard = &self.shards[shardIndex(key, self.shard_mask)];
             const item = shard.delete(self.allocator, key) orelse return null;
@@ -187,6 +236,7 @@ pub fn Cache(comptime V: type) type {
             return .{ .item = item, .allocator = self.allocator };
         }
 
+        /// Clear all items.
         pub fn clear(self: *Self) void {
             for (self.shards) |*shard| {
                 shard.clear(self.allocator);
@@ -194,6 +244,7 @@ pub fn Cache(comptime V: type) type {
             self.total_weight.store(0, .release);
         }
 
+        /// Count of stored items.
         pub fn itemCount(self: *Self) usize {
             var n: usize = 0;
             for (self.shards) |*s| {
@@ -202,10 +253,12 @@ pub fn Cache(comptime V: type) type {
             return n;
         }
 
+        /// Alias for itemCount.
         pub fn len(self: *Self) usize {
             return self.itemCount();
         }
 
+        /// Whether cache is empty.
         pub fn isEmpty(self: *Self) bool {
             return self.len() == 0;
         }
@@ -219,6 +272,9 @@ pub fn Cache(comptime V: type) type {
             return true;
         }
 
+        /// Snapshot all items.
+        ///
+        /// Returned ItemRefs must be deinit'd by the caller.
         pub fn snapshot(self: *Self, allocator: std.mem.Allocator) !std.ArrayList(ItemRef) {
             var list: std.ArrayList(ItemRef) = .empty;
 
@@ -237,6 +293,7 @@ pub fn Cache(comptime V: type) type {
             return list;
         }
 
+        /// Filter items by predicate.
         pub fn filter(self: *Self, allocator: std.mem.Allocator, pred: ItemPredicate) !std.ArrayList(ItemRef) {
             var list: std.ArrayList(ItemRef) = .empty;
 
