@@ -1,18 +1,18 @@
 const std = @import("std");
 
-fn _nowNs() i64 {
+fn nowNs() i64 {
     const ns: i128 = std.time.nanoTimestamp();
     if (ns > std.math.maxInt(i64)) return std.math.maxInt(i64);
     if (ns < std.math.minInt(i64)) return std.math.minInt(i64);
     return @intCast(ns);
 }
 
-fn _addTtl(now: i64, ttl_ns: u64) i64 {
+fn addTtl(now: i64, ttl_ns: u64) i64 {
     const ttl: i64 = if (ttl_ns > @as(u64, std.math.maxInt(i64))) std.math.maxInt(i64) else @intCast(ttl_ns);
     return std.math.add(i64, now, ttl) catch std.math.maxInt(i64);
 }
 
-fn _maybeDeinitValue(comptime V: type, allocator: std.mem.Allocator, value: *V) void {
+fn maybeDeinitValue(comptime V: type, allocator: std.mem.Allocator, value: *V) void {
     switch (@typeInfo(V)) {
         .@"struct", .@"union", .@"enum", .@"opaque" => {
             if (@hasDecl(V, "deinit")) {
@@ -36,10 +36,10 @@ pub fn Item(comptime V: type) type {
         weight: usize,
 
         expires_at_ns: std.atomic.Value(i64),
-        created_tick: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        created_at_tick: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
         hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-        last_access: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-        live: std.atomic.Value(u8) = std.atomic.Value(u8).init(1),
+        last_access_tick: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        live: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
         ref_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
 
         /// Allocate a new item.
@@ -50,11 +50,11 @@ pub fn Item(comptime V: type) type {
                 .key = owned_key,
                 .value = value,
                 .weight = weight,
-                .expires_at_ns = std.atomic.Value(i64).init(_addTtl(_nowNs(), ttl_ns)),
-                .created_tick = std.atomic.Value(u64).init(0),
+                .expires_at_ns = std.atomic.Value(i64).init(addTtl(nowNs(), ttl_ns)),
+                .created_at_tick = std.atomic.Value(u64).init(0),
                 .hits = std.atomic.Value(u64).init(0),
-                .last_access = std.atomic.Value(u64).init(0),
-                .live = std.atomic.Value(u8).init(1),
+                .last_access_tick = std.atomic.Value(u64).init(0),
+                .live = std.atomic.Value(bool).init(true),
                 .ref_count = std.atomic.Value(usize).init(1),
             };
             return item;
@@ -63,17 +63,17 @@ pub fn Item(comptime V: type) type {
         /// Reset an existing item in-place (used by reuse pools if added later).
         pub fn reset(self: *Self, allocator: std.mem.Allocator, key: []const u8, value: V, ttl_ns: u64, weight: usize) !void {
             allocator.free(self.key);
-            _maybeDeinitValue(V, allocator, &self.value);
+            maybeDeinitValue(V, allocator, &self.value);
 
             self.key = try allocator.dupe(u8, key);
             self.value = value;
             self.weight = weight;
 
-            self.expires_at_ns.store(_addTtl(_nowNs(), ttl_ns), .release);
-            self.created_tick.store(0, .release);
+            self.expires_at_ns.store(addTtl(nowNs(), ttl_ns), .release);
+            self.created_at_tick.store(0, .release);
             self.hits.store(0, .release);
-            self.last_access.store(0, .release);
-            self.live.store(1, .release);
+            self.last_access_tick.store(0, .release);
+            self.live.store(true, .release);
         }
 
         /// Increment the reference count.
@@ -86,47 +86,47 @@ pub fn Item(comptime V: type) type {
             const prev = self.ref_count.fetchSub(1, .acq_rel);
             if (prev == 1) {
                 allocator.free(self.key);
-                _maybeDeinitValue(V, allocator, &self.value);
+                maybeDeinitValue(V, allocator, &self.value);
                 allocator.destroy(self);
             }
         }
 
         /// Mark the item as dead (deleted/evicted).
         pub fn markDead(self: *Self) void {
-            self.live.store(0, .release);
+            self.live.store(false, .release);
         }
 
         /// Report whether the item is still live.
         pub fn isLive(self: *Self) bool {
-            return self.live.load(.acquire) == 1;
+            return self.live.load(.acquire);
         }
 
         /// Report whether the item is expired.
         pub fn isExpired(self: *Self) bool {
-            return self.expires_at_ns.load(.acquire) < _nowNs();
+            return self.expires_at_ns.load(.acquire) < nowNs();
         }
 
         /// Remaining TTL in nanoseconds.
         pub fn ttlNs(self: *Self) u64 {
             const expires = self.expires_at_ns.load(.acquire);
-            const now = _nowNs();
+            const now = nowNs();
             if (expires <= now) return 0;
             return @intCast(@as(i64, expires - now));
         }
 
         /// Set expiration to now+ttl_ns.
         pub fn extend(self: *Self, ttl_ns: u64) void {
-            self.expires_at_ns.store(_addTtl(_nowNs(), ttl_ns), .release);
+            self.expires_at_ns.store(addTtl(nowNs(), ttl_ns), .release);
         }
 
         /// Set the creation tick (used for hit-density eviction).
-        pub fn setCreatedTick(self: *Self, tick: u64) void {
-            self.created_tick.store(tick, .release);
+        pub fn setCreatedAtTick(self: *Self, tick: u64) void {
+            self.created_at_tick.store(tick, .release);
         }
 
         /// Read the creation tick.
-        pub fn createdTick(self: *Self) u64 {
-            return self.created_tick.load(.acquire);
+        pub fn createdAtTick(self: *Self) u64 {
+            return self.created_at_tick.load(.acquire);
         }
 
         /// Number of successful hits recorded for this item.
@@ -142,12 +142,12 @@ pub fn Item(comptime V: type) type {
 
         /// Update the access tick.
         pub fn touch(self: *Self, tick: u64) void {
-            self.last_access.store(tick, .release);
+            self.last_access_tick.store(tick, .release);
         }
 
         /// Read the access tick.
-        pub fn lastAccess(self: *Self) u64 {
-            return self.last_access.load(.acquire);
+        pub fn lastAccessTick(self: *Self) u64 {
+            return self.last_access_tick.load(.acquire);
         }
     };
 }

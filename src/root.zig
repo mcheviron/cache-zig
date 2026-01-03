@@ -7,8 +7,8 @@
 //! - Size-based eviction using sampled eviction.
 //!   When over `Config.max_weight`, the cache samples candidates across shards
 //!   and evicts using the configured eviction policy.
-//! - Optional `Cache(V).Weigher` for accurate weights.
-//!   If not provided, weight defaults to `key.len + @sizeOf(V)`.
+//! - Custom weigher context is required for LHD policies.
+//!   Otherwise, weight defaults to `key.len + @sizeOf(V)`.
 //!
 //! # Example
 //!
