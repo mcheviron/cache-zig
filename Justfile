@@ -9,7 +9,7 @@ install:
 fmt:
     zig fmt build.zig src
 
-check *args:
+build *args:
     zig build "$@"
 
 test *args:
