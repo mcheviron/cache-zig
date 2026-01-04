@@ -415,42 +415,6 @@ pub fn CacheUnmanaged(
 
         const Worker = if (policy.isStable()) StableWorker(Self, policy) else void;
 
-        fn validateFilterPredicate(comptime PredContext: type) void {
-            if (!@hasDecl(PredContext, "pred")) {
-                @compileError("filter() predicate must declare pub fn pred(self: PredContext, key: []const u8, value: *const V) bool");
-            }
-
-            const fn_info = switch (@typeInfo(@TypeOf(PredContext.pred))) {
-                .@"fn" => |f| f,
-                else => @compileError("filter() predicate 'pred' must be a function"),
-            };
-
-            const params = fn_info.params;
-            if (params.len != 3) {
-                @compileError("filter() predicate must take (self, key, value)");
-            }
-
-            const p0 = params[0].type orelse @compileError("filter() predicate missing self type");
-            if (p0 != PredContext) {
-                @compileError("filter() predicate first parameter must be PredContext (pass the predicate context by value)");
-            }
-
-            const p1 = params[1].type orelse @compileError("filter() predicate missing key type");
-            if (p1 != []const u8) {
-                @compileError("filter() predicate key parameter must be []const u8");
-            }
-
-            const p2 = params[2].type orelse @compileError("filter() predicate missing value type");
-            if (p2 != *const V) {
-                @compileError("filter() predicate value parameter must be *const V");
-            }
-
-            const ret = fn_info.return_type orelse @compileError("filter() predicate missing return type");
-            if (ret != bool) {
-                @compileError("filter() predicate must return bool");
-            }
-        }
-
         pub const ItemRef = struct {
             item: *Item,
             allocator: std.mem.Allocator,
@@ -498,13 +462,13 @@ pub fn CacheUnmanaged(
 
             const cfg = try config_in.build();
 
-            const shards = try allocator.alloc(Shard, cfg.shards);
+            const shards = try allocator.alloc(Shard, cfg.shard_count);
             for (shards) |*s| s.* = .{};
 
             return .{
                 .config = cfg,
                 .weigher = weigher,
-                .shard_mask = cfg.shards - 1,
+                .shard_mask = cfg.shard_count - 1,
                 .shards = shards,
             };
         }
@@ -516,6 +480,8 @@ pub fn CacheUnmanaged(
 
             for (self.shards) |*shard| {
                 shard.lock.lock();
+                defer shard.lock.unlock();
+
                 for (shard.items.items) |item| {
                     item.markDead();
                     item.release(allocator);
@@ -523,7 +489,6 @@ pub fn CacheUnmanaged(
                 shard.map.deinit(allocator);
                 shard.items.deinit(allocator);
                 shard.pos.deinit(allocator);
-                shard.lock.unlock();
             }
             allocator.free(self.shards);
         }
@@ -694,6 +659,42 @@ pub fn CacheUnmanaged(
             }
 
             return list;
+        }
+
+        fn validateFilterPredicate(comptime PredContext: type) void {
+            if (!@hasDecl(PredContext, "pred")) {
+                @compileError("filter() predicate must declare pub fn pred(self: PredContext, key: []const u8, value: *const V) bool");
+            }
+
+            const fn_info = switch (@typeInfo(@TypeOf(PredContext.pred))) {
+                .@"fn" => |f| f,
+                else => @compileError("filter() predicate 'pred' must be a function"),
+            };
+
+            const params = fn_info.params;
+            if (params.len != 3) {
+                @compileError("filter() predicate must take (self, key, value)");
+            }
+
+            const p0 = params[0].type orelse @compileError("filter() predicate missing self type");
+            if (p0 != PredContext) {
+                @compileError("filter() predicate first parameter must be PredContext (pass the predicate context by value)");
+            }
+
+            const p1 = params[1].type orelse @compileError("filter() predicate missing key type");
+            if (p1 != []const u8) {
+                @compileError("filter() predicate key parameter must be []const u8");
+            }
+
+            const p2 = params[2].type orelse @compileError("filter() predicate missing value type");
+            if (p2 != *const V) {
+                @compileError("filter() predicate value parameter must be *const V");
+            }
+
+            const ret = fn_info.return_type orelse @compileError("filter() predicate missing return type");
+            if (ret != bool) {
+                @compileError("filter() predicate must return bool");
+            }
         }
 
         fn weigh(self: *Self, key: []const u8, value: *const V) usize {

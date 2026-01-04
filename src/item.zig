@@ -1,28 +1,5 @@
 const std = @import("std");
 
-fn nowNs() i64 {
-    const ns: i128 = std.time.nanoTimestamp();
-    if (ns > std.math.maxInt(i64)) return std.math.maxInt(i64);
-    if (ns < std.math.minInt(i64)) return std.math.minInt(i64);
-    return @intCast(ns);
-}
-
-fn addTtl(now: i64, ttl_ns: u64) i64 {
-    const ttl: i64 = if (ttl_ns > @as(u64, std.math.maxInt(i64))) std.math.maxInt(i64) else @intCast(ttl_ns);
-    return std.math.add(i64, now, ttl) catch std.math.maxInt(i64);
-}
-
-fn maybeDeinitValue(comptime V: type, allocator: std.mem.Allocator, value: *V) void {
-    switch (@typeInfo(V)) {
-        .@"struct", .@"union", .@"enum", .@"opaque" => {
-            if (@hasDecl(V, "deinit")) {
-                value.deinit(allocator);
-            }
-        },
-        else => {},
-    }
-}
-
 /// Cache item stored by `Cache(V)`.
 ///
 /// This is an internal object allocated on the heap. `Cache(V).ItemRef` is the
@@ -63,7 +40,7 @@ pub fn Item(comptime V: type) type {
         /// Reset an existing item in-place (used by reuse pools if added later).
         pub fn reset(self: *Self, allocator: std.mem.Allocator, key: []const u8, value: V, ttl_ns: u64, weight: usize) !void {
             allocator.free(self.key);
-            maybeDeinitValue(V, allocator, &self.value);
+            maybeDeinitValue(allocator, &self.value);
 
             self.key = try allocator.dupe(u8, key);
             self.value = value;
@@ -86,7 +63,7 @@ pub fn Item(comptime V: type) type {
             const prev = self.ref_count.fetchSub(1, .acq_rel);
             if (prev == 1) {
                 allocator.free(self.key);
-                maybeDeinitValue(V, allocator, &self.value);
+                maybeDeinitValue(allocator, &self.value);
                 allocator.destroy(self);
             }
         }
@@ -148,6 +125,29 @@ pub fn Item(comptime V: type) type {
         /// Read the access tick.
         pub fn lastAccessTick(self: *Self) u64 {
             return self.last_access_tick.load(.acquire);
+        }
+
+        fn nowNs() i64 {
+            const ns: i128 = std.time.nanoTimestamp();
+            if (ns > std.math.maxInt(i64)) return std.math.maxInt(i64);
+            if (ns < std.math.minInt(i64)) return std.math.minInt(i64);
+            return @intCast(ns);
+        }
+
+        fn addTtl(now: i64, ttl_ns: u64) i64 {
+            const ttl: i64 = if (ttl_ns > @as(u64, std.math.maxInt(i64))) std.math.maxInt(i64) else @intCast(ttl_ns);
+            return std.math.add(i64, now, ttl) catch std.math.maxInt(i64);
+        }
+
+        fn maybeDeinitValue(allocator: std.mem.Allocator, value: *V) void {
+            switch (@typeInfo(V)) {
+                .@"struct", .@"union", .@"enum", .@"opaque" => {
+                    if (@hasDecl(V, "deinit")) {
+                        value.deinit(allocator);
+                    }
+                },
+                else => {},
+            }
         }
     };
 }

@@ -175,7 +175,7 @@ test "clear removes entries" {
 test "evicts sampled LRU when over weight" {
     const alloc = std.testing.allocator;
     const cfg = Config{
-        .shards = 2,
+        .shard_count = 2,
         .max_weight = 30,
         .items_to_prune = 10,
         .sample_size = 1024,
@@ -209,7 +209,7 @@ test "evicts sampled LHD when over weight" {
     const alloc = std.testing.allocator;
 
     const cfg = Config{
-        .shards = 2,
+        .shard_count = 2,
         .max_weight = 20,
         .items_to_prune = 10,
         .sample_size = 1024,
@@ -243,7 +243,7 @@ test "evicts stable LRU when over weight" {
     const alloc = std.testing.allocator;
 
     const cfg = Config{
-        .shards = 2,
+        .shard_count = 2,
         .max_weight = 30,
         .items_to_prune = 10,
         .sample_size = 1024,
@@ -290,7 +290,7 @@ test "evicts stable LHD when over weight" {
     const alloc = std.testing.allocator;
 
     const cfg = Config{
-        .shards = 2,
+        .shard_count = 2,
         .max_weight = 20,
         .items_to_prune = 10,
         .sample_size = 1024,

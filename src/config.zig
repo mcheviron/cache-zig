@@ -9,7 +9,7 @@ pub const Config = struct {
     /// Number of shards; must be a power of two.
     ///
     /// Higher shard counts may improve parallelism at the cost of memory.
-    shards: usize = 16,
+    shard_count: usize = 16,
 
     /// Total weight capacity before eviction.
     max_weight: usize = 5000,
@@ -50,12 +50,12 @@ pub const Config = struct {
     ///
     /// ```zig
     /// const cache_zig = @import("cache_zig");
-    /// const cfg = try cache_zig.Config{ .shards = 16 }.build();
+    /// const cfg = try cache_zig.Config{ .shard_count = 16 }.build();
     /// _ = cfg;
     /// ```
     pub fn build(self: Config) BuildError!Config {
-        if (self.shards == 0) return error.ShardCountZero;
-        if ((self.shards & (self.shards - 1)) != 0) return error.ShardCountNotPowerOfTwo;
+        if (self.shard_count == 0) return error.ShardCountZero;
+        if ((self.shard_count & (self.shard_count - 1)) != 0) return error.ShardCountNotPowerOfTwo;
 
         var out = self;
         out.items_to_prune = @max(out.items_to_prune, 1);
