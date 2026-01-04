@@ -1,14 +1,20 @@
 const std = @import("std");
-const Cache = @import("cache.zig").Cache;
-const Config = @import("config.zig").Config;
 
-fn cost10(_: ?*anyopaque, _: []const u8, _: *const anyopaque) usize {
-    return 10;
-}
+const Config = @import("config.zig").Config;
+const SampledLruCache = @import("cache.zig").SampledLruCache;
+const SampledLhdCache = @import("cache.zig").SampledLhdCache;
+const StableLruCache = @import("cache.zig").StableLruCache;
+const StableLhdCache = @import("cache.zig").StableLhdCache;
+
+const Weigher10 = struct {
+    pub fn weigh(_: @This(), _: []const u8, _: *const u64) usize {
+        return 10;
+    }
+};
 
 test "set/get/delete roundtrip" {
     const alloc = std.testing.allocator;
-    var cache = try Cache(u64).init(alloc, comptime Config{ .max_weight = 10_000 });
+    var cache = try SampledLruCache(u64).init(alloc, Config{ .max_weight = 10_000 });
     defer cache.deinit();
 
     var item = try cache.set("a", 123, 60 * std.time.ns_per_s);
@@ -32,7 +38,7 @@ test "set/get/delete roundtrip" {
 
 test "get missing returns null" {
     const alloc = std.testing.allocator;
-    var cache = try Cache(u8).init(alloc, comptime Config{ .max_weight = 10_000 });
+    var cache = try SampledLruCache(u8).init(alloc, Config{ .max_weight = 10_000 });
     defer cache.deinit();
 
     try std.testing.expect(cache.get("missing") == null);
@@ -40,7 +46,7 @@ test "get missing returns null" {
 
 test "delete missing returns null" {
     const alloc = std.testing.allocator;
-    var cache = try Cache(u8).init(alloc, comptime Config{ .max_weight = 10_000 });
+    var cache = try SampledLruCache(u8).init(alloc, Config{ .max_weight = 10_000 });
     defer cache.deinit();
 
     try std.testing.expect(cache.delete("missing") == null);
@@ -48,7 +54,7 @@ test "delete missing returns null" {
 
 test "extend missing returns false" {
     const alloc = std.testing.allocator;
-    var cache = try Cache(u8).init(alloc, comptime Config{ .max_weight = 10_000 });
+    var cache = try SampledLruCache(u8).init(alloc, Config{ .max_weight = 10_000 });
     defer cache.deinit();
 
     try std.testing.expect(!cache.extend("missing", 1 * std.time.ns_per_s));
@@ -56,7 +62,7 @@ test "extend missing returns false" {
 
 test "extend updates ttl" {
     const alloc = std.testing.allocator;
-    var cache = try Cache(u8).init(alloc, comptime Config{ .max_weight = 10_000 });
+    var cache = try SampledLruCache(u8).init(alloc, Config{ .max_weight = 10_000 });
     defer cache.deinit();
 
     {
@@ -75,7 +81,7 @@ test "extend updates ttl" {
 
 test "get expired is miss by default" {
     const alloc = std.testing.allocator;
-    var cache = try Cache(u8).init(alloc, comptime Config{ .max_weight = 10_000 });
+    var cache = try SampledLruCache(u8).init(alloc, Config{ .max_weight = 10_000 });
     defer cache.deinit();
 
     var item = try cache.set("a", 1, 1 * std.time.ns_per_ms);
@@ -88,7 +94,7 @@ test "get expired is miss by default" {
 
 test "replace preserves ttl" {
     const alloc = std.testing.allocator;
-    var cache = try Cache(u8).init(alloc, comptime Config{ .max_weight = 10_000 });
+    var cache = try SampledLruCache(u8).init(alloc, Config{ .max_weight = 10_000 });
     defer cache.deinit();
 
     try std.testing.expect((try cache.replace("missing", 1)) == null);
@@ -115,7 +121,7 @@ test "replace preserves ttl" {
 
 test "snapshot and filter" {
     const alloc = std.testing.allocator;
-    var cache = try Cache(u8).init(alloc, comptime Config{ .max_weight = 10_000 });
+    var cache = try SampledLruCache(u8).init(alloc, Config{ .max_weight = 10_000 });
     defer cache.deinit();
 
     {
@@ -153,7 +159,7 @@ test "snapshot and filter" {
 
 test "clear removes entries" {
     const alloc = std.testing.allocator;
-    var cache = try Cache(u8).init(alloc, comptime Config{ .max_weight = 10_000 });
+    var cache = try SampledLruCache(u8).init(alloc, Config{ .max_weight = 10_000 });
     defer cache.deinit();
 
     {
@@ -168,15 +174,14 @@ test "clear removes entries" {
 
 test "evicts sampled LRU when over weight" {
     const alloc = std.testing.allocator;
-    const cfg = comptime Config{
+    const cfg = Config{
         .shards = 2,
         .max_weight = 30,
         .items_to_prune = 10,
         .sample_size = 1024,
-        .eviction_policy = .sampled_lru,
     };
 
-    var cache = try Cache(u64).init(alloc, cfg);
+    var cache = try SampledLruCache(u64).init(alloc, cfg);
     defer cache.deinit();
 
     {
@@ -200,19 +205,17 @@ test "evicts sampled LRU when over weight" {
     try std.testing.expect(cache.peek("k1") == null);
 }
 
-test "evicts least hit dense when over weight" {
+test "evicts sampled LHD when over weight" {
     const alloc = std.testing.allocator;
 
-    const cfg = comptime Config{
+    const cfg = Config{
         .shards = 2,
         .max_weight = 20,
         .items_to_prune = 10,
         .sample_size = 1024,
-        .eviction_policy = .sampled_lhd,
-        .cost_fn = cost10,
     };
 
-    var cache = try Cache(u64).init(alloc, cfg);
+    var cache = try SampledLhdCache(u64, Weigher10).init(alloc, cfg);
     defer cache.deinit();
 
     {
@@ -239,15 +242,14 @@ test "evicts least hit dense when over weight" {
 test "evicts stable LRU when over weight" {
     const alloc = std.testing.allocator;
 
-    const cfg = comptime Config{
+    const cfg = Config{
         .shards = 2,
         .max_weight = 30,
         .items_to_prune = 10,
         .sample_size = 1024,
-        .eviction_policy = .stable_lru,
     };
 
-    var cache = try Cache(u64).init(alloc, cfg);
+    var cache = try StableLruCache(u64).init(alloc, cfg);
     defer cache.deinit();
 
     {
@@ -287,16 +289,14 @@ test "evicts stable LRU when over weight" {
 test "evicts stable LHD when over weight" {
     const alloc = std.testing.allocator;
 
-    const cfg = comptime Config{
+    const cfg = Config{
         .shards = 2,
         .max_weight = 20,
         .items_to_prune = 10,
         .sample_size = 1024,
-        .eviction_policy = .stable_lhd,
-        .cost_fn = cost10,
     };
 
-    var cache = try Cache(u64).init(alloc, cfg);
+    var cache = try StableLhdCache(u64, Weigher10).init(alloc, cfg);
     defer cache.deinit();
 
     {

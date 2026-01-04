@@ -1,213 +1,76 @@
 const std = @import("std");
 
 const Config = @import("config.zig").Config;
+const weigher_mod = @import("weigher.zig");
 const ItemMod = @import("item.zig");
 const ShardMod = @import("shard.zig");
 
-fn _shardIndex(key: []const u8, mask: usize) usize {
+fn shardIndex(key: []const u8, mask: usize) usize {
     var h = std.hash.Fnv1a_64.init();
     h.update(key);
     const digest = h.final();
     return @as(usize, @intCast(digest)) & mask;
 }
 
-/// Construct a cache type specialized for value type `V`.
-///
-/// The cache stores items by string key (`[]const u8` in Zig terms) and a
-/// compile-time value type `V`.
-///
-/// Public methods return `ItemRef`, a reference-counted handle which must be
-/// `deinit()`'d by the caller.
-///
-/// TTL note:
-///
-/// By default, expired items are treated as cache misses.
-/// Set `Config.treat_expired_as_miss=false` to allow `get`/`peek` to return
-/// expired items.
-///
-/// Eviction:
-///
-/// When the cache exceeds `Config.max_weight`, eviction samples candidates
-/// across shards and evicts using the configured eviction policy.
-///
-/// Costing:
-///
-/// Cost is used for both capacity (`max_weight`) and LHD ranking.
-///
-/// - If `Config.cost_fn` is set, it is used.
-/// - Otherwise cost uses `Config.default_cost_mode`.
-///
-/// For LHD policies (`sampled_lhd` / `stable_lhd`), `Config.cost_fn` is required.
-pub fn Cache(comptime V: type) type {
+pub const EvictionPolicy = enum {
+    sampled_lru,
+    sampled_lhd,
+    stable_lru,
+    stable_lhd,
+
+    pub fn isStable(self: EvictionPolicy) bool {
+        return self == .stable_lru or self == .stable_lhd;
+    }
+
+    pub fn isLhd(self: EvictionPolicy) bool {
+        return self == .sampled_lhd or self == .stable_lhd;
+    }
+};
+
+fn validateWeigher(comptime V: type, comptime Weigher: type) void {
+    if (!@hasDecl(Weigher, "weigh")) {
+        @compileError("Weigher must declare pub fn weigh(self: Weigher, key: []const u8, value: *const V) usize");
+    }
+
+    const fn_info = switch (@typeInfo(@TypeOf(Weigher.weigh))) {
+        .@"fn" => |f| f,
+        else => @compileError("Weigher.weigh must be a function"),
+    };
+
+    const params = fn_info.params;
+    if (params.len != 3) {
+        @compileError("Weigher.weigh must take (self, key, value)");
+    }
+
+    const p0 = params[0].type orelse @compileError("Weigher.weigh missing self type");
+    if (p0 != Weigher) {
+        @compileError("Weigher.weigh first parameter must be Weigher (pass context by value)");
+    }
+
+    const p1 = params[1].type orelse @compileError("Weigher.weigh missing key type");
+    if (p1 != []const u8) {
+        @compileError("Weigher.weigh key parameter must be []const u8");
+    }
+
+    const p2 = params[2].type orelse @compileError("Weigher.weigh missing value type");
+    if (p2 != *const V) {
+        @compileError("Weigher.weigh value parameter must be *const V");
+    }
+
+    const ret = fn_info.return_type orelse @compileError("Weigher.weigh missing return type");
+    if (ret != usize) {
+        @compileError("Weigher.weigh must return usize");
+    }
+}
+
+fn StableWorker(comptime CacheT: type, comptime stable_policy: EvictionPolicy) type {
+    if (stable_policy != .stable_lru and stable_policy != .stable_lhd) {
+        @compileError("StableWorker requires a stable eviction policy");
+    }
+
     return struct {
         const Self = @This();
-
-        /// Internal item type.
-        pub const Item = ItemMod.Item(V);
-        const Shard = ShardMod.Shard(*Item);
-
-        fn validateFilterPredicate(comptime PredContext: type) void {
-            if (!@hasDecl(PredContext, "pred")) {
-                @compileError("filter() predicate must declare pub fn pred(self: PredContext, key: []const u8, value: *const V) bool");
-            }
-
-            const fn_info = switch (@typeInfo(@TypeOf(PredContext.pred))) {
-                .@"fn" => |f| f,
-                else => @compileError("filter() predicate 'pred' must be a function"),
-            };
-
-            const params = fn_info.params;
-            if (params.len != 3) {
-                @compileError("filter() predicate must take (self, key, value)");
-            }
-
-            const p0 = params[0].type orelse @compileError("filter() predicate missing self type");
-            if (p0 != PredContext) {
-                @compileError("filter() predicate first parameter must be PredContext (pass the predicate context by value)");
-            }
-
-            const p1 = params[1].type orelse @compileError("filter() predicate missing key type");
-            if (p1 != []const u8) {
-                @compileError("filter() predicate key parameter must be []const u8");
-            }
-
-            const p2 = params[2].type orelse @compileError("filter() predicate missing value type");
-            if (p2 != *const V) {
-                @compileError("filter() predicate value parameter must be *const V");
-            }
-
-            const ret = fn_info.return_type orelse @compileError("filter() predicate missing return type");
-            if (ret != bool) {
-                @compileError("filter() predicate must return bool");
-            }
-        }
-
-        /// Handle to an item stored in the cache.
-        ///
-        /// This is a reference-counted handle. Always call `deinit()`.
-        /// Dropping an ItemRef does not delete the key from the cache; deletion
-        /// happens via `delete` or eviction.
-        pub const ItemRef = struct {
-            item: *Item,
-            allocator: std.mem.Allocator,
-
-            /// Release this reference.
-            ///
-            /// Always call this (usually via `defer ref.deinit()`).
-            pub fn deinit(self: ItemRef) void {
-                self.item.release(self.allocator);
-            }
-
-            /// Get the key bytes.
-            ///
-            /// # Example
-            ///
-            /// ```zig
-            /// const std = @import("std");
-            /// const cache_zig = @import("cache_zig");
-            ///
-            /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
-            /// defer cache.deinit();
-            ///
-            /// var set_ref = try cache.set("k", 1, 60 * std.time.ns_per_s);
-            /// defer set_ref.deinit();
-            ///
-            /// var ref = cache.get("k") orelse return error.Miss;
-            /// defer ref.deinit();
-            /// try std.testing.expectEqualStrings("k", ref.key());
-            /// ```
-            pub fn key(self: ItemRef) []const u8 {
-                return self.item.key;
-            }
-
-            /// Get a pointer to the stored value.
-            ///
-            /// # Example
-            ///
-            /// ```zig
-            /// const std = @import("std");
-            /// const cache_zig = @import("cache_zig");
-            ///
-            /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
-            /// defer cache.deinit();
-            ///
-            /// var set_ref = try cache.set("k", 123, 60 * std.time.ns_per_s);
-            /// defer set_ref.deinit();
-            ///
-            /// var ref = cache.get("k") orelse return error.Miss;
-            /// defer ref.deinit();
-            /// try std.testing.expectEqual(@as(u64, 123), ref.value().*);
-            /// ```
-            pub fn value(self: ItemRef) *const V {
-                return &self.item.value;
-            }
-
-            /// Whether this item is expired.
-            ///
-            /// # Example
-            ///
-            /// ```zig
-            /// const std = @import("std");
-            /// const cache_zig = @import("cache_zig");
-            ///
-            /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
-            /// defer cache.deinit();
-            ///
-            /// var set_ref = try cache.set("k", 1, 1);
-            /// defer set_ref.deinit();
-            ///
-            /// var ref = cache.peek("k") orelse return error.Miss;
-            /// defer ref.deinit();
-            /// _ = ref.isExpired();
-            /// ```
-            pub fn isExpired(self: ItemRef) bool {
-                return self.item.isExpired();
-            }
-
-            /// Remaining TTL in nanoseconds.
-            ///
-            /// # Example
-            ///
-            /// ```zig
-            /// const std = @import("std");
-            /// const cache_zig = @import("cache_zig");
-            ///
-            /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
-            /// defer cache.deinit();
-            ///
-            /// var set_ref = try cache.set("k", 1, 60 * std.time.ns_per_s);
-            /// defer set_ref.deinit();
-            ///
-            /// var ref = cache.peek("k") orelse return error.Miss;
-            /// defer ref.deinit();
-            /// try std.testing.expect(ref.ttlNs() > 0);
-            /// ```
-            pub fn ttlNs(self: ItemRef) u64 {
-                return self.item.ttlNs();
-            }
-
-            /// Extend TTL (sets expiration to now + ttl_ns).
-            ///
-            /// # Example
-            ///
-            /// ```zig
-            /// const std = @import("std");
-            /// const cache_zig = @import("cache_zig");
-            ///
-            /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
-            /// defer cache.deinit();
-            ///
-            /// var set_ref = try cache.set("k", 1, 1);
-            /// defer set_ref.deinit();
-            ///
-            /// var ref = cache.peek("k") orelse return error.Miss;
-            /// defer ref.deinit();
-            /// ref.extend(60 * std.time.ns_per_s);
-            /// ```
-            pub fn extend(self: ItemRef, ttl_ns: u64) void {
-                self.item.extend(ttl_ns);
-            }
-        };
+        const Item = CacheT.Item;
 
         const StableLru = struct {
             const Entry = struct {
@@ -288,350 +151,337 @@ pub fn Cache(comptime V: type) type {
             }
         };
 
-        const StableWorker = struct {
-            const Policy = enum { stable_lru, stable_lhd };
-
-            const Event = union(enum) {
-                promote: *Item,
-                delete: *Item,
-                evict: *std.Thread.ResetEvent,
-                clear: *std.Thread.ResetEvent,
-            };
-
-            allocator: std.mem.Allocator,
-            cache: *Self,
-            policy: Policy,
-
-            lock: std.Thread.Mutex = .{},
-            cond: std.Thread.Condition = .{},
-            buf: []Event,
-            head: usize = 0,
-            tail: usize = 0,
-            len: usize = 0,
-            stopping: bool = false,
-
-            thread: std.Thread,
-            lru: StableLru = .{},
-
-            fn init(cache: *Self, policy: Policy) !*StableWorker {
-                const allocator = cache.allocator;
-                const cap = cache.config.promote_buffer + cache.config.delete_buffer + 8;
-
-                const w = try allocator.create(StableWorker);
-                w.* = .{
-                    .allocator = allocator,
-                    .cache = cache,
-                    .policy = policy,
-                    .buf = try allocator.alloc(Event, @max(cap, 8)),
-                    .thread = undefined,
-                };
-
-                w.thread = try std.Thread.spawn(.{}, StableWorker.run, .{w});
-                return w;
-            }
-
-            fn deinit(self: *StableWorker) void {
-                self.lock.lock();
-                self.stopping = true;
-                self.cond.broadcast();
-                self.lock.unlock();
-
-                self.thread.join();
-
-                while (self.len > 0) {
-                    const ev = self._popUnsafe();
-                    switch (ev) {
-                        .promote => |it| it.release(self.allocator),
-                        .delete => |it| it.release(self.allocator),
-                        .evict => |ack| ack.set(),
-                        .clear => |ack| ack.set(),
-                    }
-                }
-
-                self.lru.deinit(self.allocator);
-                self.allocator.free(self.buf);
-                self.allocator.destroy(self);
-            }
-
-            fn tryEnqueuePromote(self: *StableWorker, item: *Item) void {
-                item.retain();
-                self.lock.lock();
-                defer self.lock.unlock();
-
-                if (self.stopping or self.len == self.buf.len) {
-                    item.release(self.allocator);
-                    return;
-                }
-
-                self._pushUnsafe(.{ .promote = item });
-                self.cond.signal();
-            }
-
-            fn enqueuePromote(self: *StableWorker, item: *Item) void {
-                item.retain();
-                self.lock.lock();
-                defer self.lock.unlock();
-
-                while (!self.stopping and self.len == self.buf.len) {
-                    self.cond.wait(&self.lock);
-                }
-
-                if (self.stopping) {
-                    item.release(self.allocator);
-                    return;
-                }
-
-                self._pushUnsafe(.{ .promote = item });
-                self.cond.signal();
-            }
-
-            fn enqueueDelete(self: *StableWorker, item: *Item) void {
-                item.retain();
-                self.lock.lock();
-                defer self.lock.unlock();
-
-                while (!self.stopping and self.len == self.buf.len) {
-                    self.cond.wait(&self.lock);
-                }
-
-                if (self.stopping) {
-                    item.release(self.allocator);
-                    return;
-                }
-
-                self._pushUnsafe(.{ .delete = item });
-                self.cond.signal();
-            }
-
-            fn enqueueClear(self: *StableWorker) void {
-                var ack = std.Thread.ResetEvent{};
-                ack.reset();
-
-                self.lock.lock();
-                while (!self.stopping and self.len == self.buf.len) {
-                    self.cond.wait(&self.lock);
-                }
-
-                if (self.stopping) {
-                    self.lock.unlock();
-                    return;
-                }
-
-                self._pushUnsafe(.{ .clear = &ack });
-                self.cond.signal();
-                self.lock.unlock();
-
-                ack.wait();
-            }
-
-            fn enqueueEvict(self: *StableWorker) void {
-                var ack = std.Thread.ResetEvent{};
-                ack.reset();
-
-                self.lock.lock();
-                while (!self.stopping and self.len == self.buf.len) {
-                    self.cond.wait(&self.lock);
-                }
-
-                if (self.stopping) {
-                    self.lock.unlock();
-                    return;
-                }
-
-                self._pushUnsafe(.{ .evict = &ack });
-                self.cond.signal();
-                self.lock.unlock();
-
-                ack.wait();
-            }
-
-            fn _pushUnsafe(self: *StableWorker, ev: Event) void {
-                self.buf[self.tail] = ev;
-                self.tail = (self.tail + 1) % self.buf.len;
-                self.len += 1;
-            }
-
-            fn _popUnsafe(self: *StableWorker) Event {
-                const ev = self.buf[self.head];
-                self.head = (self.head + 1) % self.buf.len;
-                self.len -= 1;
-                return ev;
-            }
-
-            fn run(self: *StableWorker) void {
-                while (true) {
-                    self.lock.lock();
-                    while (!self.stopping and self.len == 0) {
-                        self.cond.wait(&self.lock);
-                    }
-
-                    if (self.stopping) {
-                        self.lock.unlock();
-                        return;
-                    }
-
-                    const ev = self._popUnsafe();
-                    self.cond.signal();
-                    self.lock.unlock();
-
-                    var run_evict = true;
-                    switch (ev) {
-                        .promote => |it| {
-                            if (self.policy == .stable_lru) {
-                                self.lru.promote(self.allocator, it, self.cache.config.gets_per_promote) catch {
-                                    it.release(self.allocator);
-                                };
-                            } else {
-                                it.release(self.allocator);
-                            }
-                        },
-                        .delete => |it| {
-                            if (self.policy == .stable_lru) {
-                                self.lru.removeIfSame(self.allocator, it);
-                            }
-                            it.release(self.allocator);
-                        },
-                        .evict => |ack| {
-                            run_evict = false;
-                            self.evictIfNeeded();
-                            ack.set();
-                        },
-                        .clear => |ack| {
-                            self.lru.clear(self.allocator);
-                            ack.set();
-                        },
-                    }
-
-                    if (run_evict) {
-                        self.evictIfNeeded();
-                    }
-                }
-            }
-
-            fn evictIfNeeded(self: *StableWorker) void {
-                var evicted: usize = 0;
-                while (self.cache.total_weight.load(.acquire) > self.cache.config.max_weight and evicted < self.cache.config.items_to_prune) {
-                    switch (self.policy) {
-                        .stable_lru => {
-                            const pop = self.lru.popLru(self.allocator) orelse return;
-                            defer pop.item.release(self.allocator);
-
-                            pop.item.markDead();
-
-                            const shard = &self.cache.shards[_shardIndex(pop.key, self.cache.shard_mask)];
-                            if (shard.deleteIfSame(self.allocator, pop.key, pop.item)) |removed| {
-                                _ = self.cache.total_weight.fetchSub(removed.weight, .acq_rel);
-                                removed.release(self.allocator);
-                            }
-                        },
-                        .stable_lhd => {
-                            const candidate = self.cache.scanLeastHitDense() orelse return;
-                            defer candidate.release(self.allocator);
-
-                            candidate.markDead();
-
-                            const shard = &self.cache.shards[_shardIndex(candidate.key, self.cache.shard_mask)];
-                            if (shard.deleteIfSame(self.allocator, candidate.key, candidate)) |removed| {
-                                _ = self.cache.total_weight.fetchSub(removed.weight, .acq_rel);
-                                removed.release(self.allocator);
-                            }
-                        },
-                    }
-
-                    evicted += 1;
-                }
-            }
-        };
-
-        const Eviction = union(enum) {
-            sampled_lru,
-            sampled_lhd,
-            stable_lru: ?*StableWorker,
-            stable_lhd: ?*StableWorker,
-
-            fn init(_: *Self, policy: Config.EvictionPolicy) !Eviction {
-                return switch (policy) {
-                    .sampled_lhd => .sampled_lhd,
-                    .stable_lru => .{ .stable_lru = null },
-                    .stable_lhd => .{ .stable_lhd = null },
-                    else => .sampled_lru,
-                };
-            }
-
-            fn deinit(self: *Eviction) void {
-                switch (self.*) {
-                    .stable_lru => |w_opt| if (w_opt) |w| w.deinit(),
-                    .stable_lhd => |w_opt| if (w_opt) |w| w.deinit(),
-                    else => {},
-                }
-            }
-
-            fn ensureStarted(self: *Eviction, cache: *Self) !void {
-                switch (self.*) {
-                    .stable_lru => |*w_opt| {
-                        if (w_opt.* == null) {
-                            w_opt.* = try StableWorker.init(cache, .stable_lru);
-                        }
-                    },
-                    .stable_lhd => |*w_opt| {
-                        if (w_opt.* == null) {
-                            w_opt.* = try StableWorker.init(cache, .stable_lhd);
-                        }
-                    },
-                    else => {},
-                }
-            }
-
-            fn enqueueEvict(self: *Eviction) void {
-                switch (self.*) {
-                    .stable_lru => |w_opt| if (w_opt) |w| w.enqueueEvict(),
-                    .stable_lhd => |w_opt| if (w_opt) |w| w.enqueueEvict(),
-                    else => {},
-                }
-            }
-
-            fn onGet(self: *Eviction, item: *Item) void {
-                switch (self.*) {
-                    .stable_lru => |w_opt| if (w_opt) |w| w.tryEnqueuePromote(item),
-                    .stable_lhd => |w_opt| if (w_opt) |w| w.tryEnqueuePromote(item),
-                    else => {},
-                }
-            }
-
-            fn onSet(self: *Eviction, item: *Item) void {
-                switch (self.*) {
-                    .stable_lru => |w_opt| if (w_opt) |w| w.enqueuePromote(item),
-                    .stable_lhd => |w_opt| if (w_opt) |w| w.enqueuePromote(item),
-                    else => {},
-                }
-            }
-
-            fn onDelete(self: *Eviction, item: *Item) void {
-                switch (self.*) {
-                    .stable_lru => |w_opt| if (w_opt) |w| w.enqueueDelete(item),
-                    .stable_lhd => |w_opt| if (w_opt) |w| w.enqueueDelete(item),
-                    else => {},
-                }
-            }
-
-            fn onClear(self: *Eviction) void {
-                switch (self.*) {
-                    .stable_lru => |w_opt| if (w_opt) |w| w.enqueueClear(),
-                    .stable_lhd => |w_opt| if (w_opt) |w| w.enqueueClear(),
-                    else => {},
-                }
-            }
-
-            fn isStable(self: Eviction) bool {
-                return switch (self) {
-                    .stable_lru, .stable_lhd => true,
-                    else => false,
-                };
-            }
+        const Event = union(enum) {
+            promote: *Item,
+            delete: *Item,
+            evict: *std.Thread.ResetEvent,
+            clear: *std.Thread.ResetEvent,
         };
 
         allocator: std.mem.Allocator,
+        cache: *CacheT,
+
+        lock: std.Thread.Mutex = .{},
+        cond: std.Thread.Condition = .{},
+        buf: []Event,
+        head: usize = 0,
+        tail: usize = 0,
+        len: usize = 0,
+        stopping: bool = false,
+
+        thread: std.Thread,
+        lru: StableLru = .{},
+
+        fn init(allocator: std.mem.Allocator, cache: *CacheT) !*Self {
+            const cap = cache.config.promote_buffer + cache.config.delete_buffer + 8;
+
+            const w = try allocator.create(Self);
+            w.* = .{
+                .allocator = allocator,
+                .cache = cache,
+                .buf = try allocator.alloc(Event, @max(cap, 8)),
+                .thread = undefined,
+            };
+
+            w.thread = try std.Thread.spawn(.{}, Self.run, .{w});
+            return w;
+        }
+
+        fn deinit(self: *Self) void {
+            self.lock.lock();
+            self.stopping = true;
+            self.cond.broadcast();
+            self.lock.unlock();
+
+            self.thread.join();
+
+            while (self.len > 0) {
+                const ev = self.popUnsafe();
+                switch (ev) {
+                    .promote => |it| it.release(self.allocator),
+                    .delete => |it| it.release(self.allocator),
+                    .evict => |ack| ack.set(),
+                    .clear => |ack| ack.set(),
+                }
+            }
+
+            if (comptime stable_policy == .stable_lru) {
+                self.lru.deinit(self.allocator);
+            }
+            self.allocator.free(self.buf);
+            self.allocator.destroy(self);
+        }
+
+        fn tryEnqueuePromote(self: *Self, item: *Item) void {
+            item.retain();
+            self.lock.lock();
+            defer self.lock.unlock();
+
+            if (self.stopping or self.len == self.buf.len) {
+                item.release(self.allocator);
+                return;
+            }
+
+            self.pushUnsafe(.{ .promote = item });
+            self.cond.signal();
+        }
+
+        fn enqueuePromote(self: *Self, item: *Item) void {
+            item.retain();
+            self.lock.lock();
+            defer self.lock.unlock();
+
+            while (!self.stopping and self.len == self.buf.len) {
+                self.cond.wait(&self.lock);
+            }
+
+            if (self.stopping) {
+                item.release(self.allocator);
+                return;
+            }
+
+            self.pushUnsafe(.{ .promote = item });
+            self.cond.signal();
+        }
+
+        fn enqueueDelete(self: *Self, item: *Item) void {
+            item.retain();
+            self.lock.lock();
+            defer self.lock.unlock();
+
+            while (!self.stopping and self.len == self.buf.len) {
+                self.cond.wait(&self.lock);
+            }
+
+            if (self.stopping) {
+                item.release(self.allocator);
+                return;
+            }
+
+            self.pushUnsafe(.{ .delete = item });
+            self.cond.signal();
+        }
+
+        fn enqueueClear(self: *Self) void {
+            var ack = std.Thread.ResetEvent{};
+            ack.reset();
+
+            self.lock.lock();
+            while (!self.stopping and self.len == self.buf.len) {
+                self.cond.wait(&self.lock);
+            }
+
+            if (self.stopping) {
+                self.lock.unlock();
+                return;
+            }
+
+            self.pushUnsafe(.{ .clear = &ack });
+            self.cond.signal();
+            self.lock.unlock();
+
+            ack.wait();
+        }
+
+        fn enqueueEvict(self: *Self) void {
+            var ack = std.Thread.ResetEvent{};
+            ack.reset();
+
+            self.lock.lock();
+            while (!self.stopping and self.len == self.buf.len) {
+                self.cond.wait(&self.lock);
+            }
+
+            if (self.stopping) {
+                self.lock.unlock();
+                return;
+            }
+
+            self.pushUnsafe(.{ .evict = &ack });
+            self.cond.signal();
+            self.lock.unlock();
+
+            ack.wait();
+        }
+
+        fn pushUnsafe(self: *Self, ev: Event) void {
+            self.buf[self.tail] = ev;
+            self.tail = (self.tail + 1) % self.buf.len;
+            self.len += 1;
+        }
+
+        fn popUnsafe(self: *Self) Event {
+            const ev = self.buf[self.head];
+            self.head = (self.head + 1) % self.buf.len;
+            self.len -= 1;
+            return ev;
+        }
+
+        fn run(self: *Self) void {
+            while (true) {
+                self.lock.lock();
+                while (!self.stopping and self.len == 0) {
+                    self.cond.wait(&self.lock);
+                }
+
+                if (self.stopping) {
+                    self.lock.unlock();
+                    return;
+                }
+
+                const ev = self.popUnsafe();
+                self.cond.signal();
+                self.lock.unlock();
+
+                var run_evict = true;
+                switch (ev) {
+                    .promote => |it| {
+                        if (comptime stable_policy == .stable_lru) {
+                            self.lru.promote(self.allocator, it, self.cache.config.gets_per_promote) catch {
+                                it.release(self.allocator);
+                            };
+                        } else {
+                            it.release(self.allocator);
+                        }
+                    },
+                    .delete => |it| {
+                        if (comptime stable_policy == .stable_lru) {
+                            self.lru.removeIfSame(self.allocator, it);
+                        }
+                        it.release(self.allocator);
+                    },
+                    .evict => |ack| {
+                        run_evict = false;
+                        self.evictIfNeeded();
+                        ack.set();
+                    },
+                    .clear => |ack| {
+                        if (comptime stable_policy == .stable_lru) {
+                            self.lru.clear(self.allocator);
+                        }
+                        ack.set();
+                    },
+                }
+
+                if (run_evict) {
+                    self.evictIfNeeded();
+                }
+            }
+        }
+
+        fn evictIfNeeded(self: *Self) void {
+            var evicted: usize = 0;
+            while (self.cache.total_weight.load(.acquire) > self.cache.config.max_weight and evicted < self.cache.config.items_to_prune) {
+                if (comptime stable_policy == .stable_lru) {
+                    const pop = self.lru.popLru(self.allocator) orelse return;
+                    defer pop.item.release(self.allocator);
+
+                    pop.item.markDead();
+
+                    const shard = &self.cache.shards[shardIndex(pop.key, self.cache.shard_mask)];
+                    if (shard.deleteIfSame(self.allocator, pop.key, pop.item)) |removed| {
+                        _ = self.cache.total_weight.fetchSub(removed.weight, .acq_rel);
+                        removed.release(self.allocator);
+                    }
+                } else {
+                    const candidate = self.cache.scanLeastHitDense(self.allocator) orelse return;
+                    defer candidate.release(self.allocator);
+
+                    candidate.markDead();
+
+                    const shard = &self.cache.shards[shardIndex(candidate.key, self.cache.shard_mask)];
+                    if (shard.deleteIfSame(self.allocator, candidate.key, candidate)) |removed| {
+                        _ = self.cache.total_weight.fetchSub(removed.weight, .acq_rel);
+                        removed.release(self.allocator);
+                    }
+                }
+
+                evicted += 1;
+            }
+        }
+    };
+}
+
+pub fn CacheUnmanaged(
+    comptime V: type,
+    comptime policy: EvictionPolicy,
+    comptime Weigher: type,
+) type {
+    return struct {
+        const Self = @This();
+
+        pub const Item = ItemMod.Item(V);
+        const Shard = ShardMod.Shard(*Item);
+
+        const Worker = if (policy.isStable()) StableWorker(Self, policy) else void;
+
+        fn validateFilterPredicate(comptime PredContext: type) void {
+            if (!@hasDecl(PredContext, "pred")) {
+                @compileError("filter() predicate must declare pub fn pred(self: PredContext, key: []const u8, value: *const V) bool");
+            }
+
+            const fn_info = switch (@typeInfo(@TypeOf(PredContext.pred))) {
+                .@"fn" => |f| f,
+                else => @compileError("filter() predicate 'pred' must be a function"),
+            };
+
+            const params = fn_info.params;
+            if (params.len != 3) {
+                @compileError("filter() predicate must take (self, key, value)");
+            }
+
+            const p0 = params[0].type orelse @compileError("filter() predicate missing self type");
+            if (p0 != PredContext) {
+                @compileError("filter() predicate first parameter must be PredContext (pass the predicate context by value)");
+            }
+
+            const p1 = params[1].type orelse @compileError("filter() predicate missing key type");
+            if (p1 != []const u8) {
+                @compileError("filter() predicate key parameter must be []const u8");
+            }
+
+            const p2 = params[2].type orelse @compileError("filter() predicate missing value type");
+            if (p2 != *const V) {
+                @compileError("filter() predicate value parameter must be *const V");
+            }
+
+            const ret = fn_info.return_type orelse @compileError("filter() predicate missing return type");
+            if (ret != bool) {
+                @compileError("filter() predicate must return bool");
+            }
+        }
+
+        pub const ItemRef = struct {
+            item: *Item,
+            allocator: std.mem.Allocator,
+
+            pub fn deinit(self: ItemRef) void {
+                self.item.release(self.allocator);
+            }
+
+            pub fn key(self: ItemRef) []const u8 {
+                return self.item.key;
+            }
+
+            pub fn value(self: ItemRef) *const V {
+                return &self.item.value;
+            }
+
+            pub fn isExpired(self: ItemRef) bool {
+                return self.item.isExpired();
+            }
+
+            pub fn ttlNs(self: ItemRef) u64 {
+                return self.item.ttlNs();
+            }
+
+            pub fn extend(self: ItemRef, ttl_ns: u64) void {
+                self.item.extend(ttl_ns);
+            }
+        };
+
         config: Config,
+        weigher: Weigher,
         shard_mask: usize,
         shards: []Shard,
 
@@ -639,181 +489,82 @@ pub fn Cache(comptime V: type) type {
         total_weight: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
         rng_state: std.atomic.Value(u64) = std.atomic.Value(u64).init(0x9e3779b97f4a7c15),
 
-        // Costing lives in `self.config`.
+        worker: if (policy.isStable()) ?*Worker else void = if (policy.isStable()) null else {},
 
-        eviction: Eviction,
+        pub const InitError = std.mem.Allocator.Error || Config.BuildError;
 
-        /// Initialize a cache.
-        ///
-        /// `config_in.build()` is called internally.
-        ///
-        /// # Example
-        ///
-        /// ```zig
-        /// const std = @import("std");
-        /// const cache_zig = @import("cache_zig");
-        ///
-        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
-        /// defer cache.deinit();
-        /// ```
-        pub const InitError = std.mem.Allocator.Error;
+        pub fn init(allocator: std.mem.Allocator, config_in: Config, weigher: Weigher) InitError!Self {
+            comptime validateWeigher(V, Weigher);
 
-        pub fn init(allocator: std.mem.Allocator, comptime config_in: Config) InitError!Self {
-            comptime var cfg = config_in;
-
-            comptime {
-                if (cfg.shards == 0 or (cfg.shards & (cfg.shards - 1)) != 0) {
-                    @compileError("Config.shards must be a power of two > 0");
-                }
-
-                cfg.items_to_prune = @max(cfg.items_to_prune, 1);
-                cfg.sample_size = @max(cfg.sample_size, 1);
-                cfg.gets_per_promote = @max(cfg.gets_per_promote, 1);
-                cfg.promote_buffer = @max(cfg.promote_buffer, 1);
-                cfg.delete_buffer = @max(cfg.delete_buffer, 1);
-
-                if ((cfg.eviction_policy == .sampled_lhd or cfg.eviction_policy == .stable_lhd) and cfg.cost_fn == null) {
-                    @compileError("LHD eviction policies require Config.cost_fn");
-                }
-            }
+            const cfg = try config_in.build();
 
             const shards = try allocator.alloc(Shard, cfg.shards);
             for (shards) |*s| s.* = .{};
 
-            var c = Self{
-                .allocator = allocator,
+            return .{
                 .config = cfg,
+                .weigher = weigher,
                 .shard_mask = cfg.shards - 1,
                 .shards = shards,
-                .eviction = undefined,
             };
-
-            c.eviction = try Eviction.init(&c, cfg.eviction_policy);
-            return c;
         }
 
-        /// Deinitialize the cache and free all items.
-        ///
-        /// After calling `deinit`, all `ItemRef`s that still exist are invalid.
-        ///
-        /// # Example
-        ///
-        /// ```zig
-        /// const std = @import("std");
-        /// const cache_zig = @import("cache_zig");
-        ///
-        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
-        /// cache.deinit();
-        /// ```
-        pub fn deinit(self: *Self) void {
-            self.eviction.deinit();
+        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            if (comptime policy.isStable()) {
+                if (self.worker) |w| w.deinit();
+            }
 
             for (self.shards) |*shard| {
                 shard.lock.lock();
                 for (shard.items.items) |item| {
                     item.markDead();
-                    item.release(self.allocator);
+                    item.release(allocator);
                 }
-                shard.map.deinit(self.allocator);
-                shard.items.deinit(self.allocator);
-                shard.pos.deinit(self.allocator);
+                shard.map.deinit(allocator);
+                shard.items.deinit(allocator);
+                shard.pos.deinit(allocator);
                 shard.lock.unlock();
             }
-            self.allocator.free(self.shards);
+            allocator.free(self.shards);
         }
 
-        /// Get an item and update its access metadata.
-        ///
-        /// Returns `null` on miss (including expired entries when
-        /// `Config.treat_expired_as_miss=true`).
-        ///
-        /// # Example
-        ///
-        /// ```zig
-        /// const std = @import("std");
-        /// const cache_zig = @import("cache_zig");
-        ///
-        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
-        /// defer cache.deinit();
-        ///
-        /// var set_ref = try cache.set("k", 1, 60 * std.time.ns_per_s);
-        /// defer set_ref.deinit();
-        ///
-        /// var ref = cache.get("k") orelse return error.Miss;
-        /// defer ref.deinit();
-        /// _ = ref;
-        /// ```
-        pub fn get(self: *Self, key: []const u8) ?ItemRef {
-            const shard = &self.shards[_shardIndex(key, self.shard_mask)];
+        pub fn get(self: *Self, allocator: std.mem.Allocator, key: []const u8) ?ItemRef {
+            const shard = &self.shards[shardIndex(key, self.shard_mask)];
             const item = shard.get(key) orelse return null;
 
             item.retain();
 
             if (self.config.treat_expired_as_miss and item.isExpired()) {
-                item.release(self.allocator);
+                item.release(allocator);
                 return null;
             }
 
             if (item.isLive() and !item.isExpired()) {
                 item.recordHit(self.nextTick());
-                self.eviction.onGet(item);
+                if (comptime policy.isStable()) {
+                    if (self.worker) |w| w.tryEnqueuePromote(item);
+                }
             }
 
-            return .{ .item = item, .allocator = self.allocator };
+            return .{ .item = item, .allocator = allocator };
         }
 
-        /// Get an item without updating access metadata.
-        ///
-        /// # Example
-        ///
-        /// ```zig
-        /// const std = @import("std");
-        /// const cache_zig = @import("cache_zig");
-        ///
-        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
-        /// defer cache.deinit();
-        ///
-        /// var set_ref = try cache.set("k", 1, 60 * std.time.ns_per_s);
-        /// defer set_ref.deinit();
-        ///
-        /// var ref = cache.peek("k") orelse return error.Miss;
-        /// defer ref.deinit();
-        /// _ = ref;
-        /// ```
-        pub fn peek(self: *Self, key: []const u8) ?ItemRef {
-            const shard = &self.shards[_shardIndex(key, self.shard_mask)];
+        pub fn peek(self: *Self, allocator: std.mem.Allocator, key: []const u8) ?ItemRef {
+            const shard = &self.shards[shardIndex(key, self.shard_mask)];
             const item = shard.get(key) orelse return null;
             item.retain();
 
             if (self.config.treat_expired_as_miss and item.isExpired()) {
-                item.release(self.allocator);
+                item.release(allocator);
                 return null;
             }
 
-            return .{ .item = item, .allocator = self.allocator };
+            return .{ .item = item, .allocator = allocator };
         }
 
-        /// Insert or update a key/value with TTL (in nanoseconds).
-        ///
-        /// Returns an `ItemRef` pointing at the stored value. This does not remove
-        /// the item from the cache.
-        ///
-        /// # Example
-        ///
-        /// ```zig
-        /// const std = @import("std");
-        /// const cache_zig = @import("cache_zig");
-        ///
-        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
-        /// defer cache.deinit();
-        ///
-        /// var ref = try cache.set("k", 123, 1 * std.time.ns_per_s);
-        /// defer ref.deinit();
-        /// try std.testing.expectEqual(@as(u64, 123), ref.value().*);
-        /// ```
-        pub fn set(self: *Self, key: []const u8, value: V, ttl_ns: u64) !ItemRef {
+        pub fn set(self: *Self, allocator: std.mem.Allocator, key: []const u8, value: V, ttl_ns: u64) !ItemRef {
             const weight = self.weigh(key, &value);
-            const item = try Item.create(self.allocator, key, value, ttl_ns, weight);
+            const item = try Item.create(allocator, key, value, ttl_ns, weight);
             const tick = self.nextTick();
             item.setCreatedAtTick(tick);
             item.touch(tick);
@@ -821,120 +572,59 @@ pub fn Cache(comptime V: type) type {
             // Shard owns one ref.
             item.retain();
 
-            const shard = &self.shards[_shardIndex(key, self.shard_mask)];
-            if (try shard.set(self.allocator, item.key, item)) |old| {
+            const shard = &self.shards[shardIndex(key, self.shard_mask)];
+            if (try shard.set(allocator, item.key, item)) |old| {
                 old.markDead();
                 _ = self.total_weight.fetchSub(old.weight, .acq_rel);
-                old.release(self.allocator); // drop shard ref
+                old.release(allocator);
             }
 
             _ = self.total_weight.fetchAdd(item.weight, .acq_rel);
-            if (self.eviction.isStable()) {
-                try self.eviction.ensureStarted(self);
-            }
-            self.eviction.onSet(item);
-            try self.evictIfNeeded();
 
-            // Caller ref.
-            return .{ .item = item, .allocator = self.allocator };
+            if (comptime policy.isStable()) {
+                try self.ensureWorkerStarted(allocator);
+                self.worker.?.enqueuePromote(item);
+                self.worker.?.enqueueEvict();
+            } else {
+                try self.evictIfNeeded(allocator);
+            }
+
+            return .{ .item = item, .allocator = allocator };
         }
 
-        /// Replace a value while preserving TTL.
-        /// Returns null if the key does not exist.
-        ///
-        /// # Example
-        ///
-        /// ```zig
-        /// const std = @import("std");
-        /// const cache_zig = @import("cache_zig");
-        ///
-        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
-        /// defer cache.deinit();
-        ///
-        /// var set_ref = try cache.set("k", 1, 60 * std.time.ns_per_s);
-        /// defer set_ref.deinit();
-        ///
-        /// const replaced = try cache.replace("k", 2) orelse return error.Miss;
-        /// defer replaced.deinit();
-        /// try std.testing.expectEqual(@as(u64, 2), replaced.value().*);
-        /// ```
-        pub fn replace(self: *Self, key: []const u8, value: V) !?ItemRef {
-            const existing = self._peekRaw(key) orelse return null;
+        pub fn replace(self: *Self, allocator: std.mem.Allocator, key: []const u8, value: V) !?ItemRef {
+            const existing = self.peekRaw(allocator, key) orelse return null;
             defer existing.deinit();
 
             const ttl = existing.ttlNs();
-            return try self.set(key, value, ttl);
+            return try self.set(allocator, key, value, ttl);
         }
 
-        /// Delete a key and return the removed item.
-        /// Returns null if missing.
-        ///
-        /// The returned `ItemRef` holds the removed value until `deinit()`.
-        ///
-        /// # Example
-        ///
-        /// ```zig
-        /// const std = @import("std");
-        /// const cache_zig = @import("cache_zig");
-        ///
-        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
-        /// defer cache.deinit();
-        ///
-        /// var set_ref = try cache.set("k", 1, 60 * std.time.ns_per_s);
-        /// defer set_ref.deinit();
-        ///
-        /// var deleted = cache.delete("k") orelse return error.Miss;
-        /// defer deleted.deinit();
-        /// try std.testing.expect(cache.peek("k") == null);
-        /// ```
-        pub fn delete(self: *Self, key: []const u8) ?ItemRef {
-            const shard = &self.shards[_shardIndex(key, self.shard_mask)];
-            const item = shard.delete(self.allocator, key) orelse return null;
+        pub fn delete(self: *Self, allocator: std.mem.Allocator, key: []const u8) ?ItemRef {
+            const shard = &self.shards[shardIndex(key, self.shard_mask)];
+            const item = shard.delete(allocator, key) orelse return null;
 
-            self.eviction.onDelete(item);
+            if (comptime policy.isStable()) {
+                if (self.worker) |w| w.enqueueDelete(item);
+            }
 
             item.markDead();
             self.total_weight.store(self.total_weight.load(.acquire) -| item.weight, .release);
 
-            // Transfer shard ref to caller.
-            return .{ .item = item, .allocator = self.allocator };
+            return .{ .item = item, .allocator = allocator };
         }
 
-        /// Clear all items.
-        ///
-        /// # Example
-        ///
-        /// ```zig
-        /// const std = @import("std");
-        /// const cache_zig = @import("cache_zig");
-        ///
-        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
-        /// defer cache.deinit();
-        ///
-        /// cache.clear();
-        /// try std.testing.expect(cache.isEmpty());
-        /// ```
-        pub fn clear(self: *Self) void {
-            self.eviction.onClear();
+        pub fn clear(self: *Self, allocator: std.mem.Allocator) void {
+            if (comptime policy.isStable()) {
+                if (self.worker) |w| w.enqueueClear();
+            }
+
             for (self.shards) |*shard| {
-                shard.clear(self.allocator);
+                shard.clear(allocator);
             }
             self.total_weight.store(0, .release);
         }
 
-        /// Count of stored items.
-        ///
-        /// # Example
-        ///
-        /// ```zig
-        /// const std = @import("std");
-        /// const cache_zig = @import("cache_zig");
-        ///
-        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
-        /// defer cache.deinit();
-        ///
-        /// try std.testing.expectEqual(@as(usize, 0), cache.itemCount());
-        /// ```
         pub fn itemCount(self: *Self) usize {
             var n: usize = 0;
             for (self.shards) |*s| {
@@ -943,58 +633,16 @@ pub fn Cache(comptime V: type) type {
             return n;
         }
 
-        /// Alias for itemCount.
-        ///
-        /// # Example
-        ///
-        /// ```zig
-        /// const std = @import("std");
-        /// const cache_zig = @import("cache_zig");
-        ///
-        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
-        /// defer cache.deinit();
-        /// try std.testing.expectEqual(cache.itemCount(), cache.len());
-        /// ```
         pub fn len(self: *Self) usize {
             return self.itemCount();
         }
 
-        /// Whether cache is empty.
-        ///
-        /// # Example
-        ///
-        /// ```zig
-        /// const std = @import("std");
-        /// const cache_zig = @import("cache_zig");
-        ///
-        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
-        /// defer cache.deinit();
-        /// try std.testing.expect(cache.isEmpty());
-        /// ```
         pub fn isEmpty(self: *Self) bool {
             return self.len() == 0;
         }
 
-        /// Extend an item TTL. Returns `false` if missing.
-        ///
-        /// This sets expiration to `now + ttl_ns`.
-        ///
-        /// # Example
-        ///
-        /// ```zig
-        /// const std = @import("std");
-        /// const cache_zig = @import("cache_zig");
-        ///
-        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
-        /// defer cache.deinit();
-        ///
-        /// var set_ref = try cache.set("k", 1, 1);
-        /// defer set_ref.deinit();
-        ///
-        /// try std.testing.expect(cache.extend("k", 60 * std.time.ns_per_s));
-        /// ```
-        pub fn extend(self: *Self, key: []const u8, ttl_ns: u64) bool {
-            const ref = self._peekRaw(key) orelse return false;
+        pub fn extend(self: *Self, allocator: std.mem.Allocator, key: []const u8, ttl_ns: u64) bool {
+            const ref = self.peekRaw(allocator, key) orelse return false;
             defer ref.deinit();
 
             ref.extend(ttl_ns);
@@ -1002,33 +650,13 @@ pub fn Cache(comptime V: type) type {
             return true;
         }
 
-        fn _peekRaw(self: *Self, key: []const u8) ?ItemRef {
-            const shard = &self.shards[_shardIndex(key, self.shard_mask)];
+        fn peekRaw(self: *Self, allocator: std.mem.Allocator, key: []const u8) ?ItemRef {
+            const shard = &self.shards[shardIndex(key, self.shard_mask)];
             const item = shard.get(key) orelse return null;
             item.retain();
-            return .{ .item = item, .allocator = self.allocator };
+            return .{ .item = item, .allocator = allocator };
         }
 
-        /// Snapshot all items.
-        ///
-        /// Returned ItemRefs must be deinit'd by the caller.
-        ///
-        /// # Example
-        ///
-        /// ```zig
-        /// const std = @import("std");
-        /// const cache_zig = @import("cache_zig");
-        ///
-        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
-        /// defer cache.deinit();
-        ///
-        /// var list = try cache.snapshot(std.testing.allocator);
-        /// defer {
-        ///     for (list.items) |ref| ref.deinit();
-        ///     list.deinit(std.testing.allocator);
-        /// }
-        /// _ = list;
-        /// ```
         pub fn snapshot(self: *Self, allocator: std.mem.Allocator) !std.ArrayList(ItemRef) {
             var list: std.ArrayList(ItemRef) = .empty;
 
@@ -1041,45 +669,12 @@ pub fn Cache(comptime V: type) type {
 
             for (tmp.items) |item| {
                 item.retain();
-                try list.append(allocator, .{ .item = item, .allocator = self.allocator });
+                try list.append(allocator, .{ .item = item, .allocator = allocator });
             }
 
             return list;
         }
 
-        /// Filter items by predicate.
-        ///
-        /// Returned ItemRefs must be deinit'd by the caller.
-        ///
-        /// # Example
-        ///
-        /// ```zig
-        /// const std = @import("std");
-        /// const cache_zig = @import("cache_zig");
-        ///
-        /// const Pred = struct {
-        ///     needle: []const u8,
-        ///
-        ///     pub fn pred(self: @This(), key: []const u8, _: *const u64) bool {
-        ///         return std.mem.eql(u8, key, self.needle);
-        ///     }
-        /// };
-        ///
-        /// var cache = try cache_zig.Cache(u64).init(std.testing.allocator, .{});
-        /// defer cache.deinit();
-        ///
-        /// var a = try cache.set("a", 1, 60 * std.time.ns_per_s);
-        /// defer a.deinit();
-        /// var b = try cache.set("b", 2, 60 * std.time.ns_per_s);
-        /// defer b.deinit();
-        ///
-        /// var list = try cache.filter(std.testing.allocator, Pred, Pred{ .needle = "a" });
-        /// defer {
-        ///     for (list.items) |ref| ref.deinit();
-        ///     list.deinit(std.testing.allocator);
-        /// }
-        /// _ = list;
-        /// ```
         pub fn filter(self: *Self, allocator: std.mem.Allocator, comptime PredContext: type, pred_ctx: PredContext) !std.ArrayList(ItemRef) {
             comptime Self.validateFilterPredicate(PredContext);
             var list: std.ArrayList(ItemRef) = .empty;
@@ -1094,7 +689,7 @@ pub fn Cache(comptime V: type) type {
             for (tmp.items) |item| {
                 if (PredContext.pred(pred_ctx, item.key, &item.value)) {
                     item.retain();
-                    try list.append(allocator, .{ .item = item, .allocator = self.allocator });
+                    try list.append(allocator, .{ .item = item, .allocator = allocator });
                 }
             }
 
@@ -1102,14 +697,15 @@ pub fn Cache(comptime V: type) type {
         }
 
         fn weigh(self: *Self, key: []const u8, value: *const V) usize {
-            if (self.config.cost_fn) |f| {
-                return f(self.config.cost_ctx, key, @ptrCast(value));
-            }
+            return self.weigher.weigh(key, value);
+        }
 
-            return switch (self.config.default_cost_mode) {
-                .bytes => key.len + @sizeOf(V),
-                .items => 1,
-            };
+        fn ensureWorkerStarted(self: *Self, allocator: std.mem.Allocator) !void {
+            if (comptime policy.isStable()) {
+                if (self.worker == null) {
+                    self.worker = try Worker.init(allocator, self);
+                }
+            }
         }
 
         fn nextTick(self: *Self) u64 {
@@ -1126,21 +722,21 @@ pub fn Cache(comptime V: type) type {
             return x;
         }
 
-        fn pickEvictionCandidate(self: *Self) ?*Item {
+        fn pickEvictionCandidate(self: *Self, allocator: std.mem.Allocator) ?*Item {
             if (self.len() <= self.config.sample_size) {
-                return switch (self.eviction) {
-                    .sampled_lhd => self.scanLeastHitDense(),
-                    else => self.scanOldest(),
-                };
+                return if (comptime policy.isLhd())
+                    self.scanLeastHitDense(allocator)
+                else
+                    self.scanOldest(allocator);
             }
 
-            return switch (self.eviction) {
-                .sampled_lhd => self.pickSampledLhd() orelse self.scanLeastHitDense(),
-                else => self.pickSampledLru() orelse self.scanOldest(),
-            };
+            return if (comptime policy.isLhd())
+                (self.pickSampledLhd(allocator) orelse self.scanLeastHitDense(allocator))
+            else
+                (self.pickSampledLru(allocator) orelse self.scanOldest(allocator));
         }
 
-        fn pickSampledLru(self: *Self) ?*Item {
+        fn pickSampledLru(self: *Self, allocator: std.mem.Allocator) ?*Item {
             var best: ?*Item = null;
             var best_tick: u64 = std.math.maxInt(u64);
 
@@ -1151,18 +747,18 @@ pub fn Cache(comptime V: type) type {
 
                 const tick = item.lastAccessTick();
                 if (best == null or tick < best_tick) {
-                    if (best) |b| b.release(self.allocator);
+                    if (best) |b| b.release(allocator);
                     best = item;
                     best_tick = tick;
                 } else {
-                    item.release(self.allocator);
+                    item.release(allocator);
                 }
             }
 
             return best;
         }
 
-        fn scanOldest(self: *Self) ?*Item {
+        fn scanOldest(self: *Self, allocator: std.mem.Allocator) ?*Item {
             var best: ?*Item = null;
             var best_tick: u64 = std.math.maxInt(u64);
 
@@ -1172,7 +768,7 @@ pub fn Cache(comptime V: type) type {
                     const tick = item.lastAccessTick();
                     if (best == null or tick < best_tick) {
                         item.retain();
-                        if (best) |b| b.release(self.allocator);
+                        if (best) |b| b.release(allocator);
                         best = item;
                         best_tick = tick;
                     }
@@ -1183,7 +779,7 @@ pub fn Cache(comptime V: type) type {
             return best;
         }
 
-        fn pickSampledLhd(self: *Self) ?*Item {
+        fn pickSampledLhd(self: *Self, allocator: std.mem.Allocator) ?*Item {
             const now_tick = @max(self.access_clock.load(.acquire), 1);
 
             var best: ?*Item = null;
@@ -1194,17 +790,17 @@ pub fn Cache(comptime V: type) type {
                 const item = shard.sampleAtRetained(@intCast(self.nextRand())) orelse continue;
 
                 if (best == null or self.lhdIsBetterCandidate(item, best.?, now_tick)) {
-                    if (best) |b| b.release(self.allocator);
+                    if (best) |b| b.release(allocator);
                     best = item;
                 } else {
-                    item.release(self.allocator);
+                    item.release(allocator);
                 }
             }
 
             return best;
         }
 
-        fn scanLeastHitDense(self: *Self) ?*Item {
+        fn scanLeastHitDense(self: *Self, allocator: std.mem.Allocator) ?*Item {
             const now_tick = @max(self.access_clock.load(.acquire), 1);
             var best: ?*Item = null;
 
@@ -1213,7 +809,7 @@ pub fn Cache(comptime V: type) type {
                 for (shard.items.items) |item| {
                     if (best == null or self.lhdIsBetterCandidate(item, best.?, now_tick)) {
                         item.retain();
-                        if (best) |b| b.release(self.allocator);
+                        if (best) |b| b.release(allocator);
                         best = item;
                     }
                 }
@@ -1251,28 +847,161 @@ pub fn Cache(comptime V: type) type {
             return .{ item.hitCount(), @max(denom, 1) };
         }
 
-        fn evictIfNeeded(self: *Self) !void {
-            if (self.eviction.isStable()) {
-                try self.eviction.ensureStarted(self);
-                self.eviction.enqueueEvict();
-                return;
-            }
-
+        fn evictIfNeeded(self: *Self, allocator: std.mem.Allocator) !void {
             var evicted: usize = 0;
             while (self.total_weight.load(.acquire) > self.config.max_weight and evicted < self.config.items_to_prune) {
-                const candidate = self.pickEvictionCandidate() orelse return;
-                defer candidate.release(self.allocator);
+                const candidate = self.pickEvictionCandidate(allocator) orelse return;
+                defer candidate.release(allocator);
 
                 candidate.markDead();
 
-                const shard = &self.shards[_shardIndex(candidate.key, self.shard_mask)];
-                if (shard.deleteIfSame(self.allocator, candidate.key, candidate)) |removed| {
+                const shard = &self.shards[shardIndex(candidate.key, self.shard_mask)];
+                if (shard.deleteIfSame(allocator, candidate.key, candidate)) |removed| {
                     _ = self.total_weight.fetchSub(removed.weight, .acq_rel);
-                    removed.release(self.allocator); // drop shard ref
+                    removed.release(allocator);
                 }
 
                 evicted += 1;
             }
         }
     };
+}
+
+pub fn Cache(
+    comptime V: type,
+    comptime policy: EvictionPolicy,
+    comptime Weigher: type,
+) type {
+    return struct {
+        const Self = @This();
+
+        pub const Unmanaged = CacheUnmanaged(V, policy, Weigher);
+        pub const ItemRef = Unmanaged.ItemRef;
+
+        unmanaged: Unmanaged,
+        allocator: std.mem.Allocator,
+
+        pub const InitError = Unmanaged.InitError;
+
+        pub fn init(allocator: std.mem.Allocator, config_in: Config) InitError!Self {
+            if (@sizeOf(Weigher) != 0) {
+                @compileError("Weigher must be specified; call initWeigher(allocator, config, weigher)");
+            }
+            return initWeigher(allocator, config_in, .{});
+        }
+
+        pub fn initWeigher(allocator: std.mem.Allocator, config_in: Config, weigher: Weigher) InitError!Self {
+            return .{
+                .unmanaged = try Unmanaged.init(allocator, config_in, weigher),
+                .allocator = allocator,
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.unmanaged.deinit(self.allocator);
+        }
+
+        pub fn get(self: *Self, key: []const u8) ?ItemRef {
+            return self.unmanaged.get(self.allocator, key);
+        }
+
+        pub fn peek(self: *Self, key: []const u8) ?ItemRef {
+            return self.unmanaged.peek(self.allocator, key);
+        }
+
+        pub fn set(self: *Self, key: []const u8, value: V, ttl_ns: u64) !ItemRef {
+            return self.unmanaged.set(self.allocator, key, value, ttl_ns);
+        }
+
+        pub fn replace(self: *Self, key: []const u8, value: V) !?ItemRef {
+            return self.unmanaged.replace(self.allocator, key, value);
+        }
+
+        pub fn delete(self: *Self, key: []const u8) ?ItemRef {
+            return self.unmanaged.delete(self.allocator, key);
+        }
+
+        pub fn clear(self: *Self) void {
+            self.unmanaged.clear(self.allocator);
+        }
+
+        pub fn itemCount(self: *Self) usize {
+            return self.unmanaged.itemCount();
+        }
+
+        pub fn len(self: *Self) usize {
+            return self.unmanaged.len();
+        }
+
+        pub fn isEmpty(self: *Self) bool {
+            return self.unmanaged.isEmpty();
+        }
+
+        pub fn extend(self: *Self, key: []const u8, ttl_ns: u64) bool {
+            return self.unmanaged.extend(self.allocator, key, ttl_ns);
+        }
+
+        pub fn snapshot(self: *Self, allocator: std.mem.Allocator) !std.ArrayList(ItemRef) {
+            var list: std.ArrayList(ItemRef) = .empty;
+
+            var tmp: std.ArrayList(*Unmanaged.Item) = .empty;
+            defer tmp.deinit(allocator);
+
+            for (self.unmanaged.shards) |*shard| {
+                try shard.snapshot(allocator, &tmp);
+            }
+
+            for (tmp.items) |item| {
+                item.retain();
+                try list.append(allocator, .{ .item = item, .allocator = self.allocator });
+            }
+
+            return list;
+        }
+
+        pub fn filter(self: *Self, allocator: std.mem.Allocator, comptime PredContext: type, pred_ctx: PredContext) !std.ArrayList(ItemRef) {
+            comptime Unmanaged.validateFilterPredicate(PredContext);
+            var list: std.ArrayList(ItemRef) = .empty;
+
+            var tmp: std.ArrayList(*Unmanaged.Item) = .empty;
+            defer tmp.deinit(allocator);
+
+            for (self.unmanaged.shards) |*shard| {
+                try shard.snapshot(allocator, &tmp);
+            }
+
+            for (tmp.items) |item| {
+                if (PredContext.pred(pred_ctx, item.key, &item.value)) {
+                    item.retain();
+                    try list.append(allocator, .{ .item = item, .allocator = self.allocator });
+                }
+            }
+
+            return list;
+        }
+    };
+}
+
+pub fn SampledLruCache(comptime V: type) type {
+    return Cache(V, .sampled_lru, weigher_mod.Bytes(V));
+}
+
+pub fn SampledLruCacheWithWeigher(comptime V: type, comptime Weigher: type) type {
+    return Cache(V, .sampled_lru, Weigher);
+}
+
+pub fn SampledLhdCache(comptime V: type, comptime Weigher: type) type {
+    return Cache(V, .sampled_lhd, Weigher);
+}
+
+pub fn StableLruCache(comptime V: type) type {
+    return Cache(V, .stable_lru, weigher_mod.Bytes(V));
+}
+
+pub fn StableLruCacheWithWeigher(comptime V: type, comptime Weigher: type) type {
+    return Cache(V, .stable_lru, Weigher);
+}
+
+pub fn StableLhdCache(comptime V: type, comptime Weigher: type) type {
+    return Cache(V, .stable_lhd, Weigher);
 }

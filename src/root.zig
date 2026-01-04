@@ -4,11 +4,9 @@
 //!
 //! - Sharded key/value storage for concurrent access.
 //! - TTL stored per item (expired entries are treated as misses by default).
-//! - Size-based eviction using sampled eviction.
-//!   When over `Config.max_weight`, the cache samples candidates across shards
-//!   and evicts using the configured eviction policy.
-//! - Custom weigher context is required for LHD policies.
-//!   Otherwise, weight defaults to `key.len + @sizeOf(V)`.
+//! - Size-based eviction when over `Config.max_weight`.
+//! - Compile-time eviction policy selection.
+//! - Custom weigher types (no `anyopaque` in public APIs).
 //!
 //! # Example
 //!
@@ -22,7 +20,7 @@
 //!     const alloc = gpa.allocator();
 //!
 //!     var cfg = cache_zig.Config{ .max_weight = 10_000 };
-//!     var cache = try cache_zig.Cache(u64).init(alloc, cfg);
+//!     var cache = try cache_zig.SampledLruCache(u64).init(alloc, cfg);
 //!     defer cache.deinit();
 //!
 //!     // set/get return an ItemRef which must be deinit'd.
@@ -47,7 +45,18 @@
 const std = @import("std");
 
 pub const Config = @import("config.zig").Config;
+pub const weigher = @import("weigher.zig");
+
+pub const EvictionPolicy = @import("cache.zig").EvictionPolicy;
+pub const CacheUnmanaged = @import("cache.zig").CacheUnmanaged;
 pub const Cache = @import("cache.zig").Cache;
+
+pub const SampledLruCache = @import("cache.zig").SampledLruCache;
+pub const SampledLruCacheWithWeigher = @import("cache.zig").SampledLruCacheWithWeigher;
+pub const SampledLhdCache = @import("cache.zig").SampledLhdCache;
+pub const StableLruCache = @import("cache.zig").StableLruCache;
+pub const StableLruCacheWithWeigher = @import("cache.zig").StableLruCacheWithWeigher;
+pub const StableLhdCache = @import("cache.zig").StableLhdCache;
 
 test {
     _ = @import("tests.zig");
