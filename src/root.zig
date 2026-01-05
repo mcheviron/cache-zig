@@ -1,63 +1,26 @@
-//! `cache-zig`: sharded in-memory cache with TTL and size-based eviction.
+//! `cache-zig`: in-memory cache with TTL and size-based eviction.
 //!
-//! Key properties:
+//! This package exposes two explicit families:
 //!
-//! - Sharded key/value storage for concurrent access.
-//! - TTL stored per item (expired entries are treated as misses by default).
-//! - Size-based eviction when over `Config.max_weight`.
-//! - Compile-time eviction policy selection.
-//! - Custom weigher types (no `anyopaque` in public APIs).
+//! - `cache_zig.multi_threaded.*`: sharded + concurrent implementation.
+//! - `cache_zig.single_threaded.*`: single-threaded implementation.
 //!
-//! # Example
-//!
-//! ```zig
-//! const std = @import("std");
-//! const cache_zig = @import("cache_zig");
-//!
-//! pub fn main() !void {
-//!     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-//!     defer _ = gpa.deinit();
-//!     const alloc = gpa.allocator();
-//!
-//!     var cfg = cache_zig.Config{ .max_weight = 10_000 };
-//!     var cache = try cache_zig.SampledLruCache(u64).init(alloc, cfg);
-//!     defer cache.deinit();
-//!
-//!     // set/get return an ItemRef which must be deinit'd.
-//!     var set_ref = try cache.set("k", 123, 60 * std.time.ns_per_s);
-//!     defer set_ref.deinit();
-//!
-//!     var get_ref = cache.get("k") orelse return error.Miss;
-//!     defer get_ref.deinit();
-//!     try std.testing.expectEqual(@as(u64, 123), get_ref.value().*);
-//! }
-//! ```
-//!
-//! # ItemRef lifetime
-//!
-//! `Cache(V).ItemRef` is a reference-counted handle to the underlying item.
-//! Always `defer item_ref.deinit()`.
-//!
-//! - `get`/`peek`/`set` return an `ItemRef` that does NOT remove the item from the cache.
-//! - `delete` removes the key from the cache and returns an `ItemRef` for the removed item;
-//!   when the last `ItemRef` is deinit'd, the item memory is freed.
+//! `cache_zig.multi_threaded.*` is unavailable under `-fsingle-threaded`.
 
-const std = @import("std");
+const builtin = @import("builtin");
 
 pub const Config = @import("config.zig").Config;
+pub const EvictionPolicy = @import("eviction_policy.zig").EvictionPolicy;
 pub const weigher = @import("weigher.zig");
 
-pub const EvictionPolicy = @import("cache.zig").EvictionPolicy;
-pub const CacheUnmanaged = @import("cache.zig").CacheUnmanaged;
-pub const Cache = @import("cache.zig").Cache;
-
-pub const SampledLruCache = @import("cache.zig").SampledLruCache;
-pub const SampledLruCacheWithWeigher = @import("cache.zig").SampledLruCacheWithWeigher;
-pub const SampledLhdCache = @import("cache.zig").SampledLhdCache;
-pub const StableLruCache = @import("cache.zig").StableLruCache;
-pub const StableLruCacheWithWeigher = @import("cache.zig").StableLruCacheWithWeigher;
-pub const StableLhdCache = @import("cache.zig").StableLhdCache;
+pub const multi_threaded = @import("multi_threaded/root.zig");
+pub const single_threaded = @import("single_threaded/root.zig");
 
 test {
-    _ = @import("tests.zig");
+    if (builtin.single_threaded) {
+        _ = @import("single_threaded/tests.zig");
+    } else {
+        _ = @import("single_threaded/tests.zig");
+        _ = @import("multi_threaded/tests.zig");
+    }
 }
