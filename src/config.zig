@@ -27,11 +27,24 @@ pub const Config = struct {
     /// When false, `get`/`peek` can return expired items.
     treat_expired_as_miss: bool = true,
 
+    /// When true (default), admission uses a frequency sketch.
+    enable_tiny_lfu: bool = true,
+
+    /// Scaling factor for the sketch sampling window.
+    tiny_lfu_sample_scale: usize = 10,
+
     /// Stable-policy promotion batching.
     ///
-    /// For stable policies, the maintenance worker only moves an entry to the front
+    /// For stable policies, the maintenance worker only applies SLRU promotion
     /// after this many `get()` hits.
     gets_per_promote: usize = 1,
+
+    /// Stable LRU protected segment size (percent of `max_weight`).
+    ///
+    /// Default is 80%, matching common SLRU guidance.
+    ///
+    /// Used only by the stable LRU policy.
+    stable_lru_protected_percent: u8 = 80,
 
     /// Buffer size for promotion/touch events.
     promote_buffer: usize = 1024,
@@ -60,7 +73,9 @@ pub const Config = struct {
         var out = self;
         out.items_to_prune = @max(out.items_to_prune, 1);
         out.sample_size = @max(out.sample_size, 1);
+        out.tiny_lfu_sample_scale = @max(out.tiny_lfu_sample_scale, 1);
         out.gets_per_promote = @max(out.gets_per_promote, 1);
+        out.stable_lru_protected_percent = if (out.stable_lru_protected_percent > 100) 100 else out.stable_lru_protected_percent;
         out.promote_buffer = @max(out.promote_buffer, 1);
         out.delete_buffer = @max(out.delete_buffer, 1);
         return out;

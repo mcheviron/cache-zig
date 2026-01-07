@@ -1,7 +1,7 @@
 const builtin = @import("builtin");
 
 pub const Config = @import("../config.zig").Config;
-pub const EvictionPolicy = @import("../eviction_policy.zig").EvictionPolicy;
+pub const Policy = @import("../policy.zig").Policy;
 
 pub const weigher = @import("../weigher.zig");
 const CacheImpl = @import("cache.zig");
@@ -12,12 +12,12 @@ fn guard() void {
     }
 }
 
-pub fn CacheUnmanaged(comptime V: type, comptime policy: EvictionPolicy, comptime Weigher: type) type {
+pub fn CacheUnmanaged(comptime V: type, comptime policy: Policy, comptime Weigher: type) type {
     guard();
     return CacheImpl.CacheUnmanaged(V, policy, Weigher);
 }
 
-pub fn Cache(comptime V: type, comptime policy: EvictionPolicy, comptime Weigher: type) type {
+pub fn Cache(comptime V: type, comptime policy: Policy, comptime Weigher: type) type {
     guard();
     return CacheImpl.Cache(V, policy, Weigher);
 }

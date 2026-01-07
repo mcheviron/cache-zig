@@ -10,7 +10,7 @@
 const builtin = @import("builtin");
 
 pub const Config = @import("config.zig").Config;
-pub const EvictionPolicy = @import("eviction_policy.zig").EvictionPolicy;
+pub const Policy = @import("policy.zig").Policy;
 pub const weigher = @import("weigher.zig");
 
 pub const multi_threaded = @import("multi_threaded/root.zig");

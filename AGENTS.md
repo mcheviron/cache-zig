@@ -125,7 +125,8 @@ Follow existing patterns in `src/*.zig` and prefer small, reviewable changes.
 In all cache-owned/returned types in both `multi_threaded` and `single_threaded` families:
 
 - Put all **fields** first, at the top of the type.
-- Put all **public functions** immediately after the fields.
+- Place any `const` declarations (such as constants needed by methods) immediately after the fields.
+- Put all **public functions** immediately after the fields and consts.
 - Put all **private functions** at the very bottom of the type.
 
 ### Concurrency

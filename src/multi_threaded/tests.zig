@@ -4,11 +4,18 @@ const Config = @import("../config.zig").Config;
 const SampledLruCache = @import("cache.zig").SampledLruCache;
 const SampledLhdCache = @import("cache.zig").SampledLhdCache;
 const StableLruCache = @import("cache.zig").StableLruCache;
+const StableLruCacheWithWeigher = @import("cache.zig").StableLruCacheWithWeigher;
 const StableLhdCache = @import("cache.zig").StableLhdCache;
 
 const Weigher10 = struct {
     pub fn weigh(_: @This(), _: []const u8, _: *const u64) usize {
         return 10;
+    }
+};
+
+const Weigher512 = struct {
+    pub fn weigh(_: @This(), _: []const u8, _: *const u64) usize {
+        return 512;
     }
 };
 
@@ -179,6 +186,7 @@ test "evicts sampled LRU when over weight" {
         .max_weight = 30,
         .items_to_prune = 10,
         .sample_size = 1024,
+        .enable_tiny_lfu = false,
     };
 
     var cache = try SampledLruCache(u64).init(alloc, cfg);
@@ -213,6 +221,7 @@ test "evicts sampled LHD when over weight" {
         .max_weight = 20,
         .items_to_prune = 10,
         .sample_size = 1024,
+        .enable_tiny_lfu = false,
     };
 
     var cache = try SampledLhdCache(u64, Weigher10).init(alloc, cfg);
@@ -247,6 +256,7 @@ test "evicts stable LRU when over weight" {
         .max_weight = 30,
         .items_to_prune = 10,
         .sample_size = 1024,
+        .enable_tiny_lfu = false,
     };
 
     var cache = try StableLruCache(u64).init(alloc, cfg);
@@ -286,6 +296,61 @@ test "evicts stable LRU when over weight" {
     }
 }
 
+test "stable LRU SLRU evicts probation first" {
+    const alloc = std.testing.allocator;
+
+    const cfg = Config{
+        .shard_count = 1,
+        .max_weight = 30,
+        .items_to_prune = 10,
+        .sample_size = 1024,
+        .gets_per_promote = 1,
+        .stable_lru_protected_percent = 50,
+        .enable_tiny_lfu = false,
+    };
+
+    var cache = try StableLruCache(u64).init(alloc, cfg);
+    defer cache.deinit();
+
+    {
+        var a = try cache.set("a", 1, 60 * std.time.ns_per_s);
+        defer a.deinit();
+        var b = try cache.set("b", 2, 60 * std.time.ns_per_s);
+        defer b.deinit();
+        var c = try cache.set("c", 3, 60 * std.time.ns_per_s);
+        defer c.deinit();
+    }
+
+    {
+        var a = cache.get("a") orelse return error.Miss;
+        a.deinit();
+        var b = cache.get("b") orelse return error.Miss;
+        b.deinit();
+    }
+
+    cache.sync();
+
+    {
+        var d = try cache.set("d", 4, 60 * std.time.ns_per_s);
+        defer d.deinit();
+    }
+
+    try std.testing.expect(cache.peek("c") == null);
+
+    {
+        var a = cache.peek("a") orelse return error.Miss;
+        defer a.deinit();
+    }
+    {
+        var b = cache.peek("b") orelse return error.Miss;
+        defer b.deinit();
+    }
+    {
+        var d = cache.peek("d") orelse return error.Miss;
+        defer d.deinit();
+    }
+}
+
 test "evicts stable LHD when over weight" {
     const alloc = std.testing.allocator;
 
@@ -294,6 +359,7 @@ test "evicts stable LHD when over weight" {
         .max_weight = 20,
         .items_to_prune = 10,
         .sample_size = 1024,
+        .enable_tiny_lfu = false,
     };
 
     var cache = try StableLhdCache(u64, Weigher10).init(alloc, cfg);
@@ -318,4 +384,159 @@ test "evicts stable LHD when over weight" {
     }
 
     try std.testing.expect(cache.peek("k2") == null);
+}
+
+test "TinyLFU rejects cold insert (sampled LRU)" {
+    const alloc = std.testing.allocator;
+
+    const cfg = Config{
+        .shard_count = 1,
+        .max_weight = 20,
+        .items_to_prune = 10,
+        .sample_size = 1024,
+    };
+
+    var cache = try SampledLruCache(u64).init(alloc, cfg);
+    defer cache.deinit();
+
+    {
+        var k1 = try cache.set("k1", 1, 60 * std.time.ns_per_s);
+        defer k1.deinit();
+        var k2 = try cache.set("k2", 2, 60 * std.time.ns_per_s);
+        defer k2.deinit();
+    }
+
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        var k1 = cache.get("k1") orelse return error.Miss;
+        k1.deinit();
+    }
+
+    {
+        var k3 = try cache.set("k3", 3, 60 * std.time.ns_per_s);
+        defer k3.deinit();
+    }
+
+    try std.testing.expect(cache.peek("k3") == null);
+
+    {
+        var k1 = cache.peek("k1") orelse return error.Miss;
+        defer k1.deinit();
+    }
+    {
+        var k2 = cache.peek("k2") orelse return error.Miss;
+        defer k2.deinit();
+    }
+}
+
+test "TinyLFU admits warmed insert (sampled LRU)" {
+    const alloc = std.testing.allocator;
+
+    const cfg = Config{
+        .shard_count = 1,
+        .max_weight = 20,
+        .items_to_prune = 10,
+        .sample_size = 1024,
+    };
+
+    var cache = try SampledLruCache(u64).init(alloc, cfg);
+    defer cache.deinit();
+
+    {
+        var k1 = try cache.set("k1", 1, 60 * std.time.ns_per_s);
+        defer k1.deinit();
+        var k2 = try cache.set("k2", 2, 60 * std.time.ns_per_s);
+        defer k2.deinit();
+    }
+
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        try std.testing.expect(cache.get("k3") == null);
+    }
+
+    {
+        var k3 = try cache.set("k3", 3, 60 * std.time.ns_per_s);
+        defer k3.deinit();
+    }
+
+    {
+        var k3 = cache.peek("k3") orelse return error.Miss;
+        defer k3.deinit();
+    }
+
+    const k1_alive = blk: {
+        if (cache.peek("k1")) |it| {
+            it.deinit();
+            break :blk true;
+        }
+        break :blk false;
+    };
+    const k2_alive = blk: {
+        if (cache.peek("k2")) |it| {
+            it.deinit();
+            break :blk true;
+        }
+        break :blk false;
+    };
+    try std.testing.expect(k1_alive != k2_alive);
+}
+
+test "TinyLFU stable LRU reject keeps LRU order" {
+    const alloc = std.testing.allocator;
+
+    const cfg = Config{
+        .shard_count = 1,
+        .max_weight = 1024,
+        .items_to_prune = 10,
+        .sample_size = 1024,
+        .gets_per_promote = 1_000_000,
+    };
+
+    var cache = try StableLruCacheWithWeigher(u64, Weigher512).init(alloc, cfg);
+    defer cache.deinit();
+
+    {
+        // Insert `k1` first so it becomes the LRU probation entry.
+        var k1 = try cache.set("k1", 1, 60 * std.time.ns_per_s);
+        defer k1.deinit();
+        var k2 = try cache.set("k2", 2, 60 * std.time.ns_per_s);
+        defer k2.deinit();
+    }
+
+    // Make the LRU victim (k1) “hot” so k3 is deterministically rejected.
+    // Keep counts below the sketch's 4-bit saturation (15).
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        var k1 = cache.get("k1") orelse return error.Miss;
+        k1.deinit();
+    }
+
+    {
+        var k3 = try cache.set("k3", 3, 60 * std.time.ns_per_s);
+        defer k3.deinit();
+    }
+
+    try std.testing.expect(cache.peek("k3") == null);
+
+    // Now make k4 even hotter than k1 so it is admitted.
+    // Keep counts below the sketch's 4-bit saturation (15).
+    i = 0;
+    while (i < 10) : (i += 1) {
+        try std.testing.expect(cache.get("k4") == null);
+    }
+
+    {
+        var k4 = try cache.set("k4", 4, 60 * std.time.ns_per_s);
+        defer k4.deinit();
+    }
+
+    {
+        var k4 = cache.peek("k4") orelse return error.Miss;
+        defer k4.deinit();
+    }
+    try std.testing.expect(cache.peek("k1") == null);
+    {
+        var k2 = cache.peek("k2") orelse return error.Miss;
+        defer k2.deinit();
+    }
 }

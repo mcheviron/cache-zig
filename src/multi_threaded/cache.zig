@@ -1,19 +1,23 @@
 const std = @import("std");
 
 const Config = @import("../config.zig").Config;
-const EvictionPolicy = @import("../eviction_policy.zig").EvictionPolicy;
+const Policy = @import("../policy.zig").Policy;
 const weigher_mod = @import("../weigher.zig");
+const FrequencySketch = @import("../frequency_sketch.zig").FrequencySketch;
 const ItemMod = @import("item.zig");
 const ShardMod = @import("shard.zig");
 
-fn shardIndex(key: []const u8, mask: usize) usize {
+fn hashKey(key: []const u8) u64 {
     var h = std.hash.Fnv1a_64.init();
     h.update(key);
-    const digest = h.final();
-    return @as(usize, @intCast(digest)) & mask;
+    return h.final();
 }
 
-fn StableWorker(comptime CacheT: type, comptime stable_policy: EvictionPolicy) type {
+fn shardIndex(key: []const u8, mask: usize) usize {
+    return @as(usize, @intCast(hashKey(key))) & mask;
+}
+
+fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
     if (stable_policy != .stable_lru and stable_policy != .stable_lhd) {
         @compileError("StableWorker requires a stable eviction policy");
     }
@@ -22,45 +26,76 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: EvictionPolicy) t
         const Self = @This();
         const Item = CacheT.Item;
 
-        const StableLru = struct {
+        const StableSlru = struct {
             const Entry = struct {
                 node: std.DoublyLinkedList.Node = .{},
                 key: []const u8,
                 item: *Item,
                 promotions: usize = 0,
+                is_protected: bool = false,
             };
 
-            list: std.DoublyLinkedList = .{},
+            probation: std.DoublyLinkedList = .{},
+            protected: std.DoublyLinkedList = .{},
+            protected_weight: usize = 0,
             index: std.StringHashMapUnmanaged(*Entry) = .{},
 
-            fn deinit(self: *StableLru, allocator: std.mem.Allocator) void {
+            fn deinit(self: *StableSlru, allocator: std.mem.Allocator) void {
                 self.clear(allocator);
                 self.index.deinit(allocator);
             }
 
-            fn clear(self: *StableLru, allocator: std.mem.Allocator) void {
-                while (self.list.pop()) |n| {
+            fn clear(self: *StableSlru, allocator: std.mem.Allocator) void {
+                while (self.probation.pop()) |n| {
                     const entry: *Entry = @fieldParentPtr("node", n);
                     _ = self.index.fetchRemove(entry.key);
                     entry.item.release(allocator);
                     allocator.destroy(entry);
                 }
+
+                while (self.protected.pop()) |n| {
+                    const entry: *Entry = @fieldParentPtr("node", n);
+                    _ = self.index.fetchRemove(entry.key);
+                    entry.item.release(allocator);
+                    allocator.destroy(entry);
+                }
+
+                self.protected_weight = 0;
             }
 
-            fn promote(self: *StableLru, allocator: std.mem.Allocator, item: *Item, gets_per_promote: usize) !void {
+            fn protectedMaxWeight(self: *StableSlru, max_weight: usize, protected_percent: u8) usize {
+                _ = self;
+                if (protected_percent == 0) return 0;
+                const pct: usize = protected_percent;
+                const raw = (max_weight * pct) / 100;
+                return @max(raw, 1);
+            }
+
+            fn ensureProtectedLimit(self: *StableSlru, max_weight: usize, protected_percent: u8) void {
+                const protected_max = self.protectedMaxWeight(max_weight, protected_percent);
+                while (self.protected_weight > protected_max) {
+                    const node = self.protected.pop() orelse break;
+                    const entry: *Entry = @fieldParentPtr("node", node);
+
+                    entry.is_protected = false;
+                    self.protected_weight -|= entry.item.weight;
+                    self.probation.prepend(&entry.node);
+                }
+            }
+
+            fn upsert(self: *StableSlru, allocator: std.mem.Allocator, item: *Item, max_weight: usize, protected_percent: u8) !void {
                 const key = item.key;
-                const threshold = @max(gets_per_promote, 1);
 
                 if (self.index.get(key)) |entry| {
+                    if (entry.is_protected) {
+                        self.protected_weight -|= entry.item.weight;
+                        self.protected_weight += item.weight;
+                        self.ensureProtectedLimit(max_weight, protected_percent);
+                    }
+
                     entry.item.release(allocator);
                     entry.item = item;
-
-                    entry.promotions += 1;
-                    if (entry.promotions >= threshold) {
-                        entry.promotions = 0;
-                        self.list.remove(&entry.node);
-                        self.list.prepend(&entry.node);
-                    }
+                    entry.promotions = 0;
 
                     if (entry.key.ptr != key.ptr) {
                         _ = self.index.fetchRemove(entry.key);
@@ -72,28 +107,77 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: EvictionPolicy) t
                 }
 
                 const entry = try allocator.create(Entry);
-                entry.* = .{ .key = key, .item = item, .promotions = 0 };
-
+                entry.* = .{ .key = key, .item = item, .promotions = 0, .is_protected = false };
                 try self.index.put(allocator, entry.key, entry);
-                self.list.prepend(&entry.node);
+                self.probation.prepend(&entry.node);
             }
 
-            fn removeIfSame(self: *StableLru, allocator: std.mem.Allocator, item: *Item) void {
+            fn recordHit(self: *StableSlru, allocator: std.mem.Allocator, item: *Item, gets_per_promote: usize, max_weight: usize, protected_percent: u8) !void {
+                const key = item.key;
+                const threshold = @max(gets_per_promote, 1);
+
+                const entry = self.index.get(key) orelse {
+                    try self.upsert(allocator, item, max_weight, protected_percent);
+                    return;
+                };
+
+                entry.item.release(allocator);
+                entry.item = item;
+
+                entry.promotions += 1;
+                if (entry.promotions < threshold) return;
+
+                entry.promotions = 0;
+
+                if (entry.is_protected) {
+                    self.protected.remove(&entry.node);
+                    self.protected.prepend(&entry.node);
+                } else {
+                    self.probation.remove(&entry.node);
+                    entry.is_protected = true;
+                    self.protected_weight += item.weight;
+                    self.protected.prepend(&entry.node);
+                    self.ensureProtectedLimit(max_weight, protected_percent);
+                }
+
+                if (entry.key.ptr != key.ptr) {
+                    _ = self.index.fetchRemove(entry.key);
+                    entry.key = key;
+                    try self.index.put(allocator, entry.key, entry);
+                }
+            }
+
+            fn removeIfSame(self: *StableSlru, allocator: std.mem.Allocator, item: *Item) void {
                 const entry = self.index.get(item.key) orelse return;
                 if (entry.item != item) return;
 
                 _ = self.index.fetchRemove(entry.key);
-                self.list.remove(&entry.node);
+                if (entry.is_protected) {
+                    self.protected.remove(&entry.node);
+                    self.protected_weight -|= entry.item.weight;
+                } else {
+                    self.probation.remove(&entry.node);
+                }
+
                 entry.item.release(allocator);
                 allocator.destroy(entry);
             }
 
             const Pop = struct { key: []const u8, item: *Item };
 
-            fn popLru(self: *StableLru, allocator: std.mem.Allocator) ?Pop {
-                const node = self.list.pop() orelse return null;
+            fn popProbationLruEntry(self: *StableSlru) ?*Entry {
+                const node = self.probation.pop() orelse return null;
+                return @fieldParentPtr("node", node);
+            }
+
+            fn popEvictionVictim(self: *StableSlru, allocator: std.mem.Allocator) ?Pop {
+                const node = self.probation.pop() orelse self.protected.pop() orelse return null;
                 const entry: *Entry = @fieldParentPtr("node", node);
                 _ = self.index.fetchRemove(entry.key);
+
+                if (entry.is_protected) {
+                    self.protected_weight -|= entry.item.weight;
+                }
 
                 const out: Pop = .{ .key = entry.key, .item = entry.item };
                 allocator.destroy(entry);
@@ -103,9 +187,11 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: EvictionPolicy) t
 
         const Event = union(enum) {
             promote: *Item,
+            insert: struct { item: *Item, replaced: bool },
             delete: *Item,
             evict: *std.Thread.ResetEvent,
             clear: *std.Thread.ResetEvent,
+            sync: *std.Thread.ResetEvent,
         };
 
         allocator: std.mem.Allocator,
@@ -120,7 +206,7 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: EvictionPolicy) t
         stopping: bool = false,
 
         thread: std.Thread,
-        lru: StableLru = .{},
+        lru: StableSlru = .{},
 
         fn init(allocator: std.mem.Allocator, cache: *CacheT) !*Self {
             const cap = cache.config.promote_buffer + cache.config.delete_buffer + 8;
@@ -149,9 +235,11 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: EvictionPolicy) t
                 const ev = self.popUnsafe();
                 switch (ev) {
                     .promote => |it| it.release(self.allocator),
+                    .insert => |ins| ins.item.release(self.allocator),
                     .delete => |it| it.release(self.allocator),
                     .evict => |ack| ack.set(),
                     .clear => |ack| ack.set(),
+                    .sync => |ack| ack.set(),
                 }
             }
 
@@ -191,6 +279,24 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: EvictionPolicy) t
             }
 
             self.pushUnsafe(.{ .promote = item });
+            self.cond.signal();
+        }
+
+        fn enqueueInsert(self: *Self, item: *Item, replaced: bool) void {
+            item.retain();
+            self.lock.lock();
+            defer self.lock.unlock();
+
+            while (!self.stopping and self.len == self.buf.len) {
+                self.cond.wait(&self.lock);
+            }
+
+            if (self.stopping) {
+                item.release(self.allocator);
+                return;
+            }
+
+            self.pushUnsafe(.{ .insert = .{ .item = item, .replaced = replaced } });
             self.cond.signal();
         }
 
@@ -254,6 +360,27 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: EvictionPolicy) t
             ack.wait();
         }
 
+        fn enqueueSync(self: *Self) void {
+            var ack = std.Thread.ResetEvent{};
+            ack.reset();
+
+            self.lock.lock();
+            while (!self.stopping and self.len == self.buf.len) {
+                self.cond.wait(&self.lock);
+            }
+
+            if (self.stopping) {
+                self.lock.unlock();
+                return;
+            }
+
+            self.pushUnsafe(.{ .sync = &ack });
+            self.cond.signal();
+            self.lock.unlock();
+
+            ack.wait();
+        }
+
         fn pushUnsafe(self: *Self, ev: Event) void {
             self.buf[self.tail] = ev;
             self.tail = (self.tail + 1) % self.buf.len;
@@ -287,11 +414,61 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: EvictionPolicy) t
                 switch (ev) {
                     .promote => |it| {
                         if (comptime stable_policy == .stable_lru) {
-                            self.lru.promote(self.allocator, it, self.cache.config.gets_per_promote) catch {
+                            self.lru.recordHit(
+                                self.allocator,
+                                it,
+                                self.cache.config.gets_per_promote,
+                                self.cache.config.max_weight,
+                                self.cache.config.stable_lru_protected_percent,
+                            ) catch {
                                 it.release(self.allocator);
                             };
                         } else {
                             it.release(self.allocator);
+                        }
+                    },
+                    .insert => |ins| {
+                        if (comptime stable_policy == .stable_lru) {
+                            if (ins.replaced) {
+                                // `upsert` consumes the retained item ref on success.
+                                self.lru.upsert(
+                                    self.allocator,
+                                    ins.item,
+                                    self.cache.config.max_weight,
+                                    self.cache.config.stable_lru_protected_percent,
+                                ) catch {
+                                    ins.item.release(self.allocator);
+                                };
+                            } else {
+                                const keep = if (self.cache.config.enable_tiny_lfu)
+                                    self.applyTinyLfuAdmissionStableLru(ins.item)
+                                else
+                                    true;
+
+                                if (keep) {
+                                    // `upsert` consumes the retained item ref on success.
+                                    self.lru.upsert(
+                                        self.allocator,
+                                        ins.item,
+                                        self.cache.config.max_weight,
+                                        self.cache.config.stable_lru_protected_percent,
+                                    ) catch {
+                                        ins.item.release(self.allocator);
+                                    };
+                                } else {
+                                    // Admission rejected: keep victims in place and drop the candidate.
+                                    ins.item.release(self.allocator);
+                                }
+                            }
+                        } else {
+                            // Stable LHD doesn't maintain an access-order structure.
+                            const keep = if (self.cache.config.enable_tiny_lfu and !ins.replaced)
+                                self.applyTinyLfuAdmissionStableLhd(ins.item)
+                            else
+                                true;
+
+                            _ = keep;
+                            ins.item.release(self.allocator);
                         }
                     },
                     .delete => |it| {
@@ -311,6 +488,10 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: EvictionPolicy) t
                         }
                         ack.set();
                     },
+                    .sync => |ack| {
+                        run_evict = false;
+                        ack.set();
+                    },
                 }
 
                 if (run_evict) {
@@ -319,11 +500,137 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: EvictionPolicy) t
             }
         }
 
+        fn evictItemFromCache(self: *Self, item: *Item) void {
+            item.markDead();
+
+            const shard = &self.cache.shards[shardIndex(item.key, self.cache.shard_mask)];
+            if (shard.deleteIfSame(self.allocator, item.key, item)) |removed| {
+                _ = self.cache.total_weight.fetchSub(removed.weight, .acq_rel);
+                removed.release(self.allocator);
+            }
+        }
+
+        fn applyTinyLfuAdmissionStableLru(self: *Self, candidate: *Item) bool {
+            if (self.cache.total_weight.load(.acquire) <= self.cache.config.max_weight) return true;
+
+            const candidate_weight = @max(candidate.weight, 1);
+            if (candidate_weight > self.cache.config.max_weight) {
+                self.evictItemFromCache(candidate);
+                return false;
+            }
+
+            self.cache.sketch_lock.lock();
+            const candidate_freq: u32 = self.cache.frequency_sketch.frequency(hashKey(candidate.key));
+            self.cache.sketch_lock.unlock();
+
+            const max_victims: usize = 8;
+            var victim_buf: [max_victims]*StableSlru.Entry = undefined;
+            var victims = std.ArrayListUnmanaged(*StableSlru.Entry).initBuffer(victim_buf[0..]);
+
+            var victims_weight: usize = 0;
+            var victims_freq: u32 = 0;
+
+            while (victims_weight < candidate_weight and victims_freq <= candidate_freq and victims.items.len < max_victims) {
+                const entry: *StableSlru.Entry = self.lru.popProbationLruEntry() orelse break;
+
+                self.cache.sketch_lock.lock();
+                const freq: u32 = self.cache.frequency_sketch.frequency(hashKey(entry.key));
+                self.cache.sketch_lock.unlock();
+
+                victims.appendBounded(entry) catch {
+                    self.lru.probation.append(&entry.node);
+                    break;
+                };
+
+                victims_weight += @max(entry.item.weight, 1);
+                victims_freq += freq;
+            }
+
+            const admit = victims_weight >= candidate_weight and candidate_freq > victims_freq;
+            if (admit) {
+                for (victims.items) |entry| {
+                    _ = self.lru.index.fetchRemove(entry.key);
+
+                    self.evictItemFromCache(entry.item);
+                    entry.item.release(self.allocator);
+                    self.allocator.destroy(entry);
+                }
+                return true;
+            }
+
+            var i: usize = victims.items.len;
+            while (i > 0) {
+                i -= 1;
+                self.lru.probation.append(&victims.items[i].node);
+            }
+
+            self.evictItemFromCache(candidate);
+            return false;
+        }
+
+        fn applyTinyLfuAdmissionStableLhd(self: *Self, candidate: *Item) bool {
+            if (self.cache.total_weight.load(.acquire) <= self.cache.config.max_weight) return true;
+
+            const candidate_weight = @max(candidate.weight, 1);
+            if (candidate_weight > self.cache.config.max_weight) {
+                self.evictItemFromCache(candidate);
+                return false;
+            }
+
+            self.cache.sketch_lock.lock();
+            const candidate_freq: u32 = self.cache.frequency_sketch.frequency(hashKey(candidate.key));
+            self.cache.sketch_lock.unlock();
+
+            const max_victims: usize = 8;
+            var victim_buf: [max_victims]*Item = undefined;
+            var victims = std.ArrayListUnmanaged(*Item).initBuffer(victim_buf[0..]);
+
+            var victims_weight: usize = 0;
+            var victims_freq: u32 = 0;
+
+            var attempts: usize = 0;
+            const max_attempts = @max(self.cache.config.items_to_prune, 1) * 4;
+
+            while (victims_weight < candidate_weight and victims_freq <= candidate_freq and victims.items.len < max_victims and attempts < max_attempts) : (attempts += 1) {
+                const victim = self.cache.scanLeastHitDense(self.allocator) orelse break;
+
+                if (victim == candidate or CacheT.containsItem(victims.items, victim)) {
+                    victim.release(self.allocator);
+                    continue;
+                }
+
+                self.cache.sketch_lock.lock();
+                const freq: u32 = self.cache.frequency_sketch.frequency(hashKey(victim.key));
+                self.cache.sketch_lock.unlock();
+
+                victims.appendBounded(victim) catch {
+                    victim.release(self.allocator);
+                    break;
+                };
+
+                victims_weight += @max(victim.weight, 1);
+                victims_freq += freq;
+            }
+
+            const admit = victims_weight >= candidate_weight and candidate_freq > victims_freq;
+            if (admit) {
+                for (victims.items) |victim| {
+                    self.evictItemFromCache(victim);
+                    victim.release(self.allocator);
+                }
+                return true;
+            }
+
+            for (victims.items) |victim| victim.release(self.allocator);
+            self.evictItemFromCache(candidate);
+            return false;
+        }
+
         fn evictIfNeeded(self: *Self) void {
             var evicted: usize = 0;
             while (self.cache.total_weight.load(.acquire) > self.cache.config.max_weight and evicted < self.cache.config.items_to_prune) {
                 if (comptime stable_policy == .stable_lru) {
-                    const pop = self.lru.popLru(self.allocator) orelse return;
+                    const pop = self.lru.popEvictionVictim(self.allocator) orelse return;
                     defer pop.item.release(self.allocator);
 
                     pop.item.markDead();
@@ -354,7 +661,7 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: EvictionPolicy) t
 
 pub fn CacheUnmanaged(
     comptime V: type,
-    comptime policy: EvictionPolicy,
+    comptime policy: Policy,
     comptime Weigher: type,
 ) type {
     const ItemT = ItemMod.Item(V);
@@ -370,6 +677,9 @@ pub fn CacheUnmanaged(
         total_weight: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
         rng_state: std.atomic.Value(u64) = std.atomic.Value(u64).init(0x9e3779b97f4a7c15),
 
+        sketch_lock: std.Thread.Mutex = .{},
+        frequency_sketch: FrequencySketch = .{},
+
         worker: if (policy.isStable()) ?*StableWorker(@This(), policy) else void = if (policy.isStable()) null else {},
 
         pub fn init(allocator: std.mem.Allocator, config_in: Config, weigher: Weigher) InitError!@This() {
@@ -380,18 +690,26 @@ pub fn CacheUnmanaged(
             const shards = try allocator.alloc(ShardT, cfg.shard_count);
             for (shards) |*s| s.* = .{};
 
-            return .{
+            var out: @This() = .{
                 .config = cfg,
                 .weigher = weigher,
                 .shard_mask = cfg.shard_count - 1,
                 .shards = shards,
             };
+
+            if (cfg.enable_tiny_lfu) {
+                try out.frequency_sketch.ensureCapacity(allocator, cfg.max_weight, cfg.tiny_lfu_sample_scale);
+            }
+
+            return out;
         }
 
         pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
             if (comptime policy.isStable()) {
                 if (self.worker) |w| w.deinit();
             }
+
+            self.frequency_sketch.deinit(allocator);
 
             for (self.shards) |*shard| {
                 shard.lock.lock();
@@ -409,6 +727,12 @@ pub fn CacheUnmanaged(
         }
 
         pub fn get(self: *@This(), allocator: std.mem.Allocator, key: []const u8) ?ItemRef {
+            if (self.config.enable_tiny_lfu) {
+                self.sketch_lock.lock();
+                self.frequency_sketch.increment(hashKey(key));
+                self.sketch_lock.unlock();
+            }
+
             const shard = &self.shards[shardIndex(key, self.shard_mask)];
             const item = shard.get(key) orelse return null;
 
@@ -453,19 +777,25 @@ pub fn CacheUnmanaged(
             item.retain();
 
             const shard = &self.shards[shardIndex(key, self.shard_mask)];
-            if (try shard.set(allocator, item.key, item)) |old| {
-                old.markDead();
-                _ = self.total_weight.fetchSub(old.weight, .acq_rel);
-                old.release(allocator);
+            const old = try shard.set(allocator, item.key, item);
+            const replaced = old != null;
+            if (old) |old_item| {
+                old_item.markDead();
+                _ = self.total_weight.fetchSub(old_item.weight, .acq_rel);
+                old_item.release(allocator);
             }
 
             _ = self.total_weight.fetchAdd(item.weight, .acq_rel);
 
             if (comptime policy.isStable()) {
                 try self.ensureWorkerStarted(allocator);
-                self.worker.?.enqueuePromote(item);
+                self.worker.?.enqueueInsert(item, replaced);
                 self.worker.?.enqueueEvict();
             } else {
+                if (self.config.enable_tiny_lfu and !replaced) {
+                    const candidate_hash = hashKey(key);
+                    _ = self.applyTinyLfuAdmission(allocator, item, candidate_hash);
+                }
                 try self.evictIfNeeded(allocator);
             }
 
@@ -503,6 +833,13 @@ pub fn CacheUnmanaged(
                 shard.clear(allocator);
             }
             self.total_weight.store(0, .release);
+        }
+
+        /// Blocks until pending stable-policy maintenance is applied.
+        pub fn sync(self: *@This()) void {
+            if (comptime policy.isStable()) {
+                if (self.worker) |w| w.enqueueSync();
+            }
         }
 
         pub fn itemCount(self: *@This()) usize {
@@ -835,6 +1172,92 @@ pub fn CacheUnmanaged(
             return .{ item.hitCount(), @max(denom, 1) };
         }
 
+        fn applyTinyLfuAdmission(self: *@This(), allocator: std.mem.Allocator, candidate: *ItemT, candidate_hash: u64) bool {
+            if (self.total_weight.load(.acquire) <= self.config.max_weight) return true;
+
+            const candidate_weight = @max(candidate.weight, 1);
+            if (candidate_weight > self.config.max_weight) {
+                self.evictCandidate(allocator, candidate);
+                return false;
+            }
+
+            self.sketch_lock.lock();
+            const candidate_freq: u32 = self.frequency_sketch.frequency(candidate_hash);
+            self.sketch_lock.unlock();
+
+            const max_victims: usize = 8;
+            var victim_buf: [max_victims]*ItemT = undefined;
+            var victims = std.ArrayListUnmanaged(*ItemT).initBuffer(victim_buf[0..]);
+
+            var victims_weight: usize = 0;
+            var victims_freq: u32 = 0;
+
+            var attempts: usize = 0;
+            const max_attempts = @max(self.config.items_to_prune, 1) * 4;
+
+            while (victims_weight < candidate_weight and victims_freq <= candidate_freq and victims.items.len < max_victims and attempts < max_attempts) : (attempts += 1) {
+                const victim = self.pickEvictionCandidate(allocator) orelse break;
+
+                if (victim == candidate or containsItem(victims.items, victim)) {
+                    victim.release(allocator);
+                    continue;
+                }
+
+                self.sketch_lock.lock();
+                const freq: u32 = self.frequency_sketch.frequency(hashKey(victim.key));
+                self.sketch_lock.unlock();
+
+                victims.appendBounded(victim) catch {
+                    victim.release(allocator);
+                    break;
+                };
+
+                victims_weight += @max(victim.weight, 1);
+                victims_freq += freq;
+            }
+
+            const admit = victims_weight >= candidate_weight and candidate_freq > victims_freq;
+            if (admit) {
+                self.evictVictims(allocator, victims.items);
+                return true;
+            }
+
+            for (victims.items) |victim| victim.release(allocator);
+            self.evictCandidate(allocator, candidate);
+            return false;
+        }
+
+        fn evictCandidate(self: *@This(), allocator: std.mem.Allocator, candidate: *ItemT) void {
+            candidate.markDead();
+
+            const shard = &self.shards[shardIndex(candidate.key, self.shard_mask)];
+            if (shard.deleteIfSame(allocator, candidate.key, candidate)) |removed| {
+                _ = self.total_weight.fetchSub(removed.weight, .acq_rel);
+                removed.release(allocator);
+            }
+        }
+
+        fn evictVictims(self: *@This(), allocator: std.mem.Allocator, victims: []const *ItemT) void {
+            for (victims) |victim| {
+                victim.markDead();
+
+                const shard = &self.shards[shardIndex(victim.key, self.shard_mask)];
+                if (shard.deleteIfSame(allocator, victim.key, victim)) |removed| {
+                    _ = self.total_weight.fetchSub(removed.weight, .acq_rel);
+                    removed.release(allocator);
+                }
+
+                victim.release(allocator);
+            }
+        }
+
+        fn containsItem(items: []const *ItemT, needle: *ItemT) bool {
+            for (items) |it| {
+                if (it == needle) return true;
+            }
+            return false;
+        }
+
         fn evictIfNeeded(self: *@This(), allocator: std.mem.Allocator) !void {
             var evicted: usize = 0;
             while (self.total_weight.load(.acquire) > self.config.max_weight and evicted < self.config.items_to_prune) {
@@ -875,7 +1298,7 @@ pub fn CacheUnmanaged(
 /// ```
 pub fn Cache(
     comptime V: type,
-    comptime policy: EvictionPolicy,
+    comptime policy: Policy,
     comptime Weigher: type,
 ) type {
     const Unmanaged = CacheUnmanaged(V, policy, Weigher);
@@ -933,6 +1356,11 @@ pub fn Cache(
         /// Removes all items from the cache.
         pub fn clear(self: *@This()) void {
             self.unmanaged.clear(self.allocator);
+        }
+
+        /// Blocks until pending stable-policy maintenance is applied.
+        pub fn sync(self: *@This()) void {
+            self.unmanaged.sync();
         }
 
         /// Returns the number of cached items.

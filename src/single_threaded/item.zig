@@ -18,6 +18,7 @@ pub fn Item(comptime V: type, comptime stable_lru: bool) type {
 
         lru_node: if (stable_lru) std.DoublyLinkedList.Node else void = if (stable_lru) .{} else {},
         promotions: if (stable_lru) usize else void = if (stable_lru) 0 else {},
+        slru_is_protected: if (stable_lru) bool else void = if (stable_lru) false else {},
 
         pub fn create(allocator: std.mem.Allocator, key: []const u8, value: V, ttl_ns: u64, weight: usize) !*Self {
             const owned_key = try allocator.dupe(u8, key);
