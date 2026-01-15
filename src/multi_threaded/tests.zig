@@ -2,6 +2,7 @@ const std = @import("std");
 
 const Config = @import("../config.zig").Config;
 const SampledLruCache = @import("cache.zig").SampledLruCache;
+const SampledLruCacheWithWeigher = @import("cache.zig").SampledLruCacheWithWeigher;
 const SampledLhdCache = @import("cache.zig").SampledLhdCache;
 const StableLruCache = @import("cache.zig").StableLruCache;
 const StableLruCacheWithWeigher = @import("cache.zig").StableLruCacheWithWeigher;
@@ -185,48 +186,14 @@ test "evicts sampled LRU when over weight" {
     const alloc = std.testing.allocator;
     const cfg = Config{
         .shard_count = 2,
-        .max_weight = 30,
-        .items_to_prune = 10,
-        .sample_size = 1024,
-        .enable_tiny_lfu = false,
-    };
-
-    var cache = try SampledLruCache(Key, u64).init(alloc, cfg);
-    defer cache.deinit();
-
-    {
-        var k1 = try cache.set("k1", 1, 60 * std.time.ns_per_s);
-        defer k1.deinit();
-        var k2 = try cache.set("k2", 2, 60 * std.time.ns_per_s);
-        defer k2.deinit();
-        var k3 = try cache.set("k3", 3, 60 * std.time.ns_per_s);
-        defer k3.deinit();
-    }
-
-    if (cache.get("k2")) |k2| {
-        defer k2.deinit();
-    }
-
-    {
-        var k4 = try cache.set("k4", 4, 60 * std.time.ns_per_s);
-        defer k4.deinit();
-    }
-
-    try std.testing.expect(cache.peek("k1") == null);
-}
-
-test "evicts sampled LHD when over weight" {
-    const alloc = std.testing.allocator;
-
-    const cfg = Config{
-        .shard_count = 2,
         .max_weight = 20,
         .items_to_prune = 10,
         .sample_size = 1024,
+        .stable_lru_window_percent = 0,
         .enable_tiny_lfu = false,
     };
 
-    var cache = try SampledLhdCache(Key, u64, Weigher10).init(alloc, cfg);
+    var cache = try SampledLruCacheWithWeigher(Key, u64, Weigher10).init(alloc, cfg);
     defer cache.deinit();
 
     {
@@ -307,6 +274,7 @@ test "stable LRU SLRU evicts probation first" {
         .items_to_prune = 10,
         .sample_size = 1024,
         .gets_per_promote = 1,
+        .stable_lru_window_percent = 0,
         .stable_lru_protected_percent = 50,
         .enable_tiny_lfu = false,
     };
@@ -350,6 +318,45 @@ test "stable LRU SLRU evicts probation first" {
     {
         var d = cache.peek("d") orelse return error.Miss;
         defer d.deinit();
+    }
+}
+
+test "stable LRU window admits probation" {
+    const alloc = std.testing.allocator;
+
+    const cfg = Config{
+        .shard_count = 1,
+        .max_weight = 20,
+        .items_to_prune = 10,
+        .sample_size = 1024,
+        .stable_lru_window_percent = 50,
+        .stable_lru_protected_percent = 0,
+        .enable_tiny_lfu = false,
+    };
+
+    var cache = try StableLruCache(Key, u64).init(alloc, cfg);
+    defer cache.deinit();
+
+    {
+        var a = try cache.set("a", 1, 60 * std.time.ns_per_s);
+        defer a.deinit();
+        var b = try cache.set("b", 2, 60 * std.time.ns_per_s);
+        defer b.deinit();
+        var c = try cache.set("c", 3, 60 * std.time.ns_per_s);
+        defer c.deinit();
+    }
+
+    cache.sync();
+
+    try std.testing.expect(cache.peek("a") == null);
+
+    {
+        var b = cache.peek("b") orelse return error.Miss;
+        defer b.deinit();
+    }
+    {
+        var c = cache.peek("c") orelse return error.Miss;
+        defer c.deinit();
     }
 }
 
@@ -491,6 +498,7 @@ test "TinyLFU stable LRU reject keeps LRU order" {
         .max_weight = 1024,
         .items_to_prune = 10,
         .sample_size = 1024,
+        .stable_lru_window_percent = 0,
         .gets_per_promote = 1_000_000,
     };
 

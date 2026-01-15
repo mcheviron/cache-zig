@@ -35,10 +35,13 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
                 key: K,
                 item: *Item,
                 promotions: usize = 0,
+                is_window: bool = false,
                 is_protected: bool = false,
             };
 
             ctx: Context = .{},
+            window: std.DoublyLinkedList = .{},
+            window_weight: usize = 0,
             probation: std.DoublyLinkedList = .{},
             protected: std.DoublyLinkedList = .{},
             protected_weight: usize = 0,
@@ -50,6 +53,13 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
             }
 
             fn clear(self: *StableSlru, allocator: std.mem.Allocator) void {
+                while (self.window.pop()) |n| {
+                    const entry: *Entry = @fieldParentPtr("node", n);
+                    _ = self.index.fetchRemoveContext(entry.key, self.ctx);
+                    entry.item.release(allocator);
+                    allocator.destroy(entry);
+                }
+
                 while (self.probation.pop()) |n| {
                     const entry: *Entry = @fieldParentPtr("node", n);
                     _ = self.index.fetchRemoveContext(entry.key, self.ctx);
@@ -64,30 +74,45 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
                     allocator.destroy(entry);
                 }
 
+                self.window_weight = 0;
                 self.protected_weight = 0;
             }
 
-            fn protectedMaxWeight(self: *StableSlru, max_weight: usize, protected_percent: u8) usize {
-                _ = self;
-                if (protected_percent == 0) return 0;
-                const pct: usize = protected_percent;
+            fn windowMaxWeight(_: *StableSlru, max_weight: usize, window_percent: u8) usize {
+                if (window_percent == 0) return 0;
+                const pct: usize = window_percent;
                 const raw = (max_weight * pct) / 100;
                 return @max(raw, 1);
             }
 
-            fn ensureProtectedLimit(self: *StableSlru, max_weight: usize, protected_percent: u8) void {
-                const protected_max = self.protectedMaxWeight(max_weight, protected_percent);
+            fn mainMaxWeight(self: *StableSlru, max_weight: usize, window_percent: u8) usize {
+                const window_max = self.windowMaxWeight(max_weight, window_percent);
+                return max_weight -| window_max;
+            }
+
+            fn protectedMaxWeight(self: *StableSlru, max_weight: usize, window_percent: u8, protected_percent: u8) usize {
+                if (protected_percent == 0) return 0;
+                const main_max = self.mainMaxWeight(max_weight, window_percent);
+                if (main_max == 0) return 0;
+                const pct: usize = protected_percent;
+                const raw = (main_max * pct) / 100;
+                return @max(raw, 1);
+            }
+
+            fn ensureProtectedLimit(self: *StableSlru, max_weight: usize, window_percent: u8, protected_percent: u8) void {
+                const protected_max = self.protectedMaxWeight(max_weight, window_percent, protected_percent);
                 while (self.protected_weight > protected_max) {
                     const node = self.protected.pop() orelse break;
                     const entry: *Entry = @fieldParentPtr("node", node);
 
+                    entry.is_window = false;
                     entry.is_protected = false;
                     self.protected_weight -|= entry.item.weight;
                     self.probation.prepend(&entry.node);
                 }
             }
 
-            fn upsert(self: *StableSlru, allocator: std.mem.Allocator, item: *Item, max_weight: usize, protected_percent: u8) !void {
+            fn upsert(self: *StableSlru, allocator: std.mem.Allocator, item: *Item, max_weight: usize, window_percent: u8, protected_percent: u8) !void {
                 const key = item.key;
 
                 if (self.index.getContext(key, self.ctx)) |entry| {
@@ -95,10 +120,13 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
                     const old_key = entry.key;
                     _ = self.index.fetchRemoveContext(old_key, self.ctx);
 
-                    if (entry.is_protected) {
+                    if (entry.is_window) {
+                        self.window_weight -|= entry.item.weight;
+                        self.window_weight += item.weight;
+                    } else if (entry.is_protected) {
                         self.protected_weight -|= entry.item.weight;
                         self.protected_weight += item.weight;
-                        self.ensureProtectedLimit(max_weight, protected_percent);
+                        self.ensureProtectedLimit(max_weight, window_percent, protected_percent);
                     }
 
                     entry.item.release(allocator);
@@ -111,17 +139,18 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
                 }
 
                 const entry = try allocator.create(Entry);
-                entry.* = .{ .key = key, .item = item, .promotions = 0, .is_protected = false };
+                entry.* = .{ .key = key, .item = item, .promotions = 0, .is_window = true, .is_protected = false };
                 try self.index.putContext(allocator, entry.key, entry, self.ctx);
-                self.probation.prepend(&entry.node);
+                self.window_weight += item.weight;
+                self.window.prepend(&entry.node);
             }
 
-            fn recordHit(self: *StableSlru, allocator: std.mem.Allocator, item: *Item, gets_per_promote: usize, max_weight: usize, protected_percent: u8) !void {
+            fn recordHit(self: *StableSlru, allocator: std.mem.Allocator, item: *Item, gets_per_promote: usize, max_weight: usize, window_percent: u8, protected_percent: u8) !void {
                 const key = item.key;
                 const threshold = @max(gets_per_promote, 1);
 
                 const entry = self.index.getContext(key, self.ctx) orelse {
-                    try self.upsert(allocator, item, max_weight, protected_percent);
+                    try self.upsert(allocator, item, max_weight, window_percent, protected_percent);
                     return;
                 };
 
@@ -134,6 +163,12 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
                 entry.item.release(allocator);
                 entry.item = item;
 
+                if (entry.is_window) {
+                    self.window.remove(&entry.node);
+                    self.window.prepend(&entry.node);
+                    return;
+                }
+
                 entry.promotions += 1;
                 if (entry.promotions < threshold) return;
 
@@ -144,10 +179,11 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
                     self.protected.prepend(&entry.node);
                 } else {
                     self.probation.remove(&entry.node);
+                    entry.is_window = false;
                     entry.is_protected = true;
                     self.protected_weight += item.weight;
                     self.protected.prepend(&entry.node);
-                    self.ensureProtectedLimit(max_weight, protected_percent);
+                    self.ensureProtectedLimit(max_weight, window_percent, protected_percent);
                 }
             }
 
@@ -156,7 +192,10 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
                 if (entry.item != item) return;
 
                 _ = self.index.fetchRemoveContext(entry.key, self.ctx);
-                if (entry.is_protected) {
+                if (entry.is_window) {
+                    self.window.remove(&entry.node);
+                    self.window_weight -|= entry.item.weight;
+                } else if (entry.is_protected) {
                     self.protected.remove(&entry.node);
                     self.protected_weight -|= entry.item.weight;
                 } else {
@@ -174,14 +213,28 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
                 return @fieldParentPtr("node", node);
             }
 
+            fn popWindowLruEntry(self: *StableSlru) ?*Entry {
+                const node = self.window.pop() orelse return null;
+                const entry: *Entry = @fieldParentPtr("node", node);
+                entry.is_window = false;
+                self.window_weight -|= entry.item.weight;
+                return entry;
+            }
+
             fn popEvictionVictim(self: *StableSlru, allocator: std.mem.Allocator) ?Pop {
-                const node = self.probation.pop() orelse self.protected.pop() orelse return null;
+                const node = self.probation.pop() orelse self.protected.pop() orelse self.window.pop() orelse return null;
                 const entry: *Entry = @fieldParentPtr("node", node);
                 _ = self.index.fetchRemoveContext(entry.key, self.ctx);
 
+                if (entry.is_window) {
+                    self.window_weight -|= entry.item.weight;
+                }
                 if (entry.is_protected) {
                     self.protected_weight -|= entry.item.weight;
                 }
+
+                entry.is_window = false;
+                entry.is_protected = false;
 
                 const out: Pop = .{ .key = entry.key, .item = entry.item };
                 allocator.destroy(entry);
@@ -423,6 +476,7 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
                                 it,
                                 self.cache.config.gets_per_promote,
                                 self.cache.config.max_weight,
+                                self.cache.config.stable_lru_window_percent,
                                 self.cache.config.stable_lru_protected_percent,
                             ) catch {
                                 it.release(self.allocator);
@@ -433,36 +487,23 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
                     },
                     .insert => |ins| {
                         if (comptime stable_policy == .stable_lru) {
-                            if (ins.replaced) {
+                            const window_percent = self.cache.config.stable_lru_window_percent;
+                            const protected_percent = self.cache.config.stable_lru_protected_percent;
+
+                            blk: {
                                 // `upsert` consumes the retained item ref on success.
                                 self.lru.upsert(
                                     self.allocator,
                                     ins.item,
                                     self.cache.config.max_weight,
-                                    self.cache.config.stable_lru_protected_percent,
+                                    window_percent,
+                                    protected_percent,
                                 ) catch {
                                     ins.item.release(self.allocator);
+                                    break :blk;
                                 };
-                            } else {
-                                const keep = if (self.cache.config.enable_tiny_lfu)
-                                    self.applyTinyLfuAdmissionStableLru(ins.item)
-                                else
-                                    true;
 
-                                if (keep) {
-                                    // `upsert` consumes the retained item ref on success.
-                                    self.lru.upsert(
-                                        self.allocator,
-                                        ins.item,
-                                        self.cache.config.max_weight,
-                                        self.cache.config.stable_lru_protected_percent,
-                                    ) catch {
-                                        ins.item.release(self.allocator);
-                                    };
-                                } else {
-                                    // Admission rejected: keep victims in place and drop the candidate.
-                                    ins.item.release(self.allocator);
-                                }
+                                self.ensureWindowLimit();
                             }
                         } else {
                             // Stable LHD doesn't maintain an access-order structure.
@@ -514,18 +555,49 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
             }
         }
 
-        fn applyTinyLfuAdmissionStableLru(self: *Self, candidate: *Item) bool {
-            if (self.cache.total_weight.load(.acquire) <= self.cache.config.max_weight) return true;
+        fn evictEntry(self: *Self, entry: *StableSlru.Entry) void {
+            _ = self.lru.index.fetchRemoveContext(entry.key, self.lru.ctx);
+            self.evictItemFromCache(entry.item);
+            entry.item.release(self.allocator);
+            self.allocator.destroy(entry);
+        }
 
+        fn ensureWindowLimit(self: *Self) void {
+            const window_max = self.lru.windowMaxWeight(self.cache.config.max_weight, self.cache.config.stable_lru_window_percent);
+            while (self.lru.window_weight > window_max) {
+                const entry = self.lru.popWindowLruEntry() orelse break;
+                self.applyTinyLfuAdmissionStableLru(entry);
+            }
+        }
+
+        fn applyTinyLfuAdmissionStableLru(self: *Self, entry: *StableSlru.Entry) void {
+            const candidate = entry.item;
             const candidate_weight = @max(candidate.weight, 1);
             if (candidate_weight > self.cache.config.max_weight) {
-                self.evictItemFromCache(candidate);
-                return false;
+                self.evictEntry(entry);
+                return;
+            }
+
+            const main_max = self.lru.mainMaxWeight(self.cache.config.max_weight, self.cache.config.stable_lru_window_percent);
+            const total_weight = self.cache.total_weight.load(.acquire);
+            const window_weight = self.lru.window_weight;
+            const main_weight = total_weight -| window_weight;
+            const main_without_candidate = main_weight -| candidate_weight;
+            const available = main_max -| main_without_candidate;
+
+            if (!self.cache.config.enable_tiny_lfu or candidate_weight <= available) {
+                entry.promotions = 0;
+                entry.is_window = false;
+                entry.is_protected = false;
+                self.lru.probation.prepend(&entry.node);
+                return;
             }
 
             self.cache.sketch_lock.lock();
             const candidate_freq: u32 = self.cache.frequency_sketch.frequency(self.cache.ctx.hash(candidate.key));
             self.cache.sketch_lock.unlock();
+
+            const required_weight = candidate_weight -| available;
 
             const max_victims: usize = 8;
             var victim_buf: [max_victims]*StableSlru.Entry = undefined;
@@ -534,42 +606,48 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
             var victims_weight: usize = 0;
             var victims_freq: u32 = 0;
 
-            while (victims_weight < candidate_weight and victims_freq <= candidate_freq and victims.items.len < max_victims) {
-                const entry: *StableSlru.Entry = self.lru.popProbationLruEntry() orelse break;
+            while (victims_weight < required_weight and victims_freq <= candidate_freq and victims.items.len < max_victims) {
+                const victim: *StableSlru.Entry = self.lru.popProbationLruEntry() orelse break;
 
                 self.cache.sketch_lock.lock();
-                const freq: u32 = self.cache.frequency_sketch.frequency(self.cache.ctx.hash(entry.key));
+                const freq: u32 = self.cache.frequency_sketch.frequency(self.cache.ctx.hash(victim.key));
                 self.cache.sketch_lock.unlock();
 
-                victims.appendBounded(entry) catch {
-                    self.lru.probation.append(&entry.node);
+                victims.appendBounded(victim) catch {
+                    self.lru.probation.append(&victim.node);
                     break;
                 };
 
-                victims_weight += @max(entry.item.weight, 1);
+                victims_weight += @max(victim.item.weight, 1);
                 victims_freq += freq;
             }
 
-            const admit = victims_weight >= candidate_weight and candidate_freq > victims_freq;
+            const admit = victims_weight >= required_weight and candidate_freq > victims_freq;
             if (admit) {
-                for (victims.items) |entry| {
-                    _ = self.lru.index.fetchRemove(entry.key);
+                for (victims.items) |victim| {
+                    _ = self.lru.index.fetchRemoveContext(victim.key, self.lru.ctx);
 
-                    self.evictItemFromCache(entry.item);
-                    entry.item.release(self.allocator);
-                    self.allocator.destroy(entry);
+                    self.evictItemFromCache(victim.item);
+                    victim.item.release(self.allocator);
+                    self.allocator.destroy(victim);
                 }
-                return true;
+
+                entry.promotions = 0;
+                entry.is_window = false;
+                entry.is_protected = false;
+                self.lru.probation.prepend(&entry.node);
+                return;
             }
 
             var i: usize = victims.items.len;
             while (i > 0) {
                 i -= 1;
+                victims.items[i].is_window = false;
+                victims.items[i].is_protected = false;
                 self.lru.probation.append(&victims.items[i].node);
             }
 
-            self.evictItemFromCache(candidate);
-            return false;
+            self.evictEntry(entry);
         }
 
         fn applyTinyLfuAdmissionStableLhd(self: *Self, candidate: *Item) bool {

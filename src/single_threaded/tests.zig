@@ -214,7 +214,7 @@ test "stable LRU SLRU evicts probation first" {
 
     var cache = try StableLruCacheWithWeigher(Key, u64, Weigher10).init(
         alloc,
-        Config{ .max_weight = 30, .gets_per_promote = 1, .stable_lru_protected_percent = 50, .enable_tiny_lfu = false },
+        Config{ .max_weight = 30, .gets_per_promote = 1, .stable_lru_window_percent = 0, .stable_lru_protected_percent = 50, .enable_tiny_lfu = false },
     );
     defer cache.deinit();
 
@@ -254,6 +254,39 @@ test "stable LRU SLRU evicts probation first" {
     {
         var d = cache.peek("d") orelse return error.Miss;
         defer d.deinit();
+    }
+}
+
+test "stable LRU window admits probation" {
+    const alloc = std.testing.allocator;
+
+    var cache = try StableLruCacheWithWeigher(Key, u64, Weigher10).init(
+        alloc,
+        Config{ .max_weight = 20, .stable_lru_window_percent = 50, .stable_lru_protected_percent = 0, .enable_tiny_lfu = false },
+    );
+    defer cache.deinit();
+
+    {
+        var a = try cache.set("a", 1, 60 * std.time.ns_per_s);
+        defer a.deinit();
+        var b = try cache.set("b", 2, 60 * std.time.ns_per_s);
+        defer b.deinit();
+        var c = try cache.set("c", 3, 60 * std.time.ns_per_s);
+        defer c.deinit();
+    }
+
+    try std.testing.expect(cache.peek("a") == null);
+
+    if (cache.peek("b")) |it| {
+        it.deinit();
+    } else {
+        return error.Miss;
+    }
+
+    if (cache.peek("c")) |it| {
+        it.deinit();
+    } else {
+        return error.Miss;
     }
 }
 

@@ -39,7 +39,14 @@ pub const Config = struct {
     /// after this many `get()` hits.
     gets_per_promote: usize = 1,
 
-    /// Stable LRU protected segment size (percent of `max_weight`).
+    /// Stable LRU window segment size (percent of `max_weight`).
+    ///
+    /// Default is 1%, matching common W-TinyLFU guidance.
+    ///
+    /// Used only by the stable LRU policy.
+    stable_lru_window_percent: u8 = 1,
+
+    /// Stable LRU protected segment size (percent of main capacity).
     ///
     /// Default is 80%, matching common SLRU guidance.
     ///
@@ -75,6 +82,7 @@ pub const Config = struct {
         out.sample_size = @max(out.sample_size, 1);
         out.tiny_lfu_sample_scale = @max(out.tiny_lfu_sample_scale, 1);
         out.gets_per_promote = @max(out.gets_per_promote, 1);
+        out.stable_lru_window_percent = if (out.stable_lru_window_percent > 100) 100 else out.stable_lru_window_percent;
         out.stable_lru_protected_percent = if (out.stable_lru_protected_percent > 100) 100 else out.stable_lru_protected_percent;
         out.promote_buffer = @max(out.promote_buffer, 1);
         out.delete_buffer = @max(out.delete_buffer, 1);

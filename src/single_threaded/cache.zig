@@ -23,7 +23,12 @@ pub const Config = struct {
     treat_expired_as_miss: bool = true,
     gets_per_promote: usize = 4,
 
-    /// Stable LRU protected segment size (percent of `max_weight`).
+    /// Stable LRU window segment size (percent of `max_weight`).
+    ///
+    /// Default is 1%, matching common W-TinyLFU guidance.
+    stable_lru_window_percent: u8 = 1,
+
+    /// Stable LRU protected segment size (percent of main capacity).
     ///
     /// Default is 80%, matching common SLRU guidance.
     stable_lru_protected_percent: u8 = 80,
@@ -36,6 +41,7 @@ pub const Config = struct {
         out.items_to_prune = @max(out.items_to_prune, 1);
         out.sample_size = @max(out.sample_size, 1);
         out.gets_per_promote = @max(out.gets_per_promote, 1);
+        out.stable_lru_window_percent = if (out.stable_lru_window_percent > 100) 100 else out.stable_lru_window_percent;
         out.stable_lru_protected_percent = if (out.stable_lru_protected_percent > 100) 100 else out.stable_lru_protected_percent;
         out.tiny_lfu_sample_scale = @max(out.tiny_lfu_sample_scale, 1);
         return out;
@@ -48,6 +54,7 @@ pub const Config = struct {
             .sample_size = cfg.sample_size,
             .treat_expired_as_miss = cfg.treat_expired_as_miss,
             .gets_per_promote = cfg.gets_per_promote,
+            .stable_lru_window_percent = cfg.stable_lru_window_percent,
             .stable_lru_protected_percent = cfg.stable_lru_protected_percent,
             .enable_tiny_lfu = cfg.enable_tiny_lfu,
             .tiny_lfu_sample_scale = cfg.tiny_lfu_sample_scale,
@@ -83,6 +90,8 @@ pub fn CacheUnmanaged(
 
         frequency_sketch: FrequencySketch = .{},
 
+        window_list: if (stable_lru) std.DoublyLinkedList else void = if (stable_lru) .{} else {},
+        window_weight: if (stable_lru) usize else void = if (stable_lru) 0 else {},
         probation_list: if (stable_lru) std.DoublyLinkedList else void = if (stable_lru) .{} else {},
         protected_list: if (stable_lru) std.DoublyLinkedList else void = if (stable_lru) .{} else {},
         protected_weight: if (stable_lru) usize else void = if (stable_lru) 0 else {},
@@ -106,18 +115,28 @@ pub fn CacheUnmanaged(
         /// Releases cache-owned references.
         pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
             if (comptime stable_lru) {
+                while (self.window_list.pop()) |n| {
+                    const item: *Item = @fieldParentPtr("lru_node", n);
+                    item.promotions = 0;
+                    item.slru_is_window = false;
+                    item.slru_is_protected = false;
+                }
+
                 while (self.probation_list.pop()) |n| {
                     const item: *Item = @fieldParentPtr("lru_node", n);
                     item.promotions = 0;
+                    item.slru_is_window = false;
                     item.slru_is_protected = false;
                 }
 
                 while (self.protected_list.pop()) |n| {
                     const item: *Item = @fieldParentPtr("lru_node", n);
                     item.promotions = 0;
+                    item.slru_is_window = false;
                     item.slru_is_protected = false;
                 }
 
+                self.window_weight = 0;
                 self.protected_weight = 0;
             }
             self.frequency_sketch.deinit(allocator);
@@ -225,20 +244,20 @@ pub fn CacheUnmanaged(
             self.total_weight += item.weight;
 
             if (comptime stable_lru) {
-                self.linkLruFront(item);
+                self.linkWindowFront(item);
             }
 
             // Take a user-owned ref before eviction can drop the cache-owned ref.
             item.retain();
             const ref: ItemRef = .{ .item = item, .allocator = allocator };
 
-            if (self.config.enable_tiny_lfu and !replaced) {
-                _ = self.applyTinyLfuAdmission(allocator, item, candidate_hash);
-            }
-
-            if (comptime policy == .stable_lru) {
+            if (comptime stable_lru) {
+                self.ensureWindowLimit(allocator);
                 self.evictStableLru(allocator);
             } else {
+                if (self.config.enable_tiny_lfu and !replaced) {
+                    _ = self.applyTinyLfuAdmission(allocator, item, candidate_hash);
+                }
                 self.evictIfNeeded(allocator);
             }
 
@@ -270,9 +289,18 @@ pub fn CacheUnmanaged(
         /// Removes all items from the cache.
         pub fn clear(self: *@This(), allocator: std.mem.Allocator) void {
             if (comptime stable_lru) {
+                while (self.window_list.pop()) |n| {
+                    const item: *Item = @fieldParentPtr("lru_node", n);
+                    item.promotions = 0;
+                    item.slru_is_window = false;
+                    item.slru_is_protected = false;
+                }
+                self.window_list = .{};
+
                 while (self.probation_list.pop()) |n| {
                     const item: *Item = @fieldParentPtr("lru_node", n);
                     item.promotions = 0;
+                    item.slru_is_window = false;
                     item.slru_is_protected = false;
                 }
                 self.probation_list = .{};
@@ -280,10 +308,12 @@ pub fn CacheUnmanaged(
                 while (self.protected_list.pop()) |n| {
                     const item: *Item = @fieldParentPtr("lru_node", n);
                     item.promotions = 0;
+                    item.slru_is_window = false;
                     item.slru_is_protected = false;
                 }
                 self.protected_list = .{};
 
+                self.window_weight = 0;
                 self.protected_weight = 0;
             }
 
@@ -479,6 +509,78 @@ pub fn CacheUnmanaged(
             return false;
         }
 
+        fn ensureWindowLimit(self: *@This(), allocator: std.mem.Allocator) void {
+            if (comptime stable_lru) {
+                const window_max = self.windowMaxWeight();
+                while (self.window_weight > window_max) {
+                    const node = self.window_list.pop() orelse break;
+                    const candidate: *Item = @fieldParentPtr("lru_node", node);
+                    candidate.lru_node.prev = null;
+                    candidate.lru_node.next = null;
+                    candidate.slru_is_window = false;
+                    self.window_weight -|= candidate.weight;
+                    self.admitWindowCandidate(allocator, candidate);
+                }
+            }
+        }
+
+        fn admitWindowCandidate(self: *@This(), allocator: std.mem.Allocator, candidate: *Item) void {
+            if (comptime stable_lru) {
+                candidate.promotions = 0;
+                candidate.slru_is_window = false;
+                candidate.slru_is_protected = false;
+
+                const candidate_weight = @max(candidate.weight, 1);
+                if (candidate_weight > self.config.max_weight) {
+                    self.evictCandidate(allocator, candidate);
+                    return;
+                }
+
+                const main_max = self.mainMaxWeight();
+                const main_weight = self.total_weight -| self.window_weight;
+                const main_without_candidate = main_weight -| candidate_weight;
+                const available = main_max -| main_without_candidate;
+
+                if (!self.config.enable_tiny_lfu or candidate_weight <= available) {
+                    self.linkProbationFront(candidate);
+                    return;
+                }
+
+                const candidate_freq: u32 = self.frequency_sketch.frequency(self.ctx.hash(candidate.key));
+                const required_weight = candidate_weight -| available;
+
+                const max_victims: usize = 8;
+                var victim_buf: [max_victims]*Item = undefined;
+                var victims = std.ArrayListUnmanaged(*Item).initBuffer(victim_buf[0..]);
+
+                var victims_weight: usize = 0;
+                var victims_freq: u32 = 0;
+
+                while (victims_weight < required_weight and victims_freq <= candidate_freq and victims.items.len < max_victims) {
+                    const node = self.probation_list.pop() orelse break;
+                    const victim: *Item = @fieldParentPtr("lru_node", node);
+                    if (victim == candidate) continue;
+
+                    const weight = @max(victim.weight, 1);
+                    const hash = self.ctx.hash(victim.key);
+
+                    victims.appendBounded(victim) catch break;
+                    victims_weight += weight;
+                    victims_freq += self.frequency_sketch.frequency(hash);
+                }
+
+                const admit = victims_weight >= required_weight and candidate_freq > victims_freq;
+                if (admit) {
+                    self.evictVictims(allocator, victims.items);
+                    self.linkProbationFront(candidate);
+                    return;
+                }
+
+                self.restoreVictims(victims.items);
+                self.evictCandidate(allocator, candidate);
+            }
+        }
+
         fn nextVictimForAdmission(self: *@This()) ?*Item {
             // Moka-faithful: admission compares against probation victims only.
             if (comptime policy == .stable_lru) {
@@ -493,6 +595,7 @@ pub fn CacheUnmanaged(
                 var i: usize = victims.len;
                 while (i > 0) {
                     i -= 1;
+                    victims[i].slru_is_window = false;
                     victims[i].slru_is_protected = false;
                     self.probation_list.append(&victims[i].lru_node);
                 }
@@ -537,12 +640,19 @@ pub fn CacheUnmanaged(
 
             var evicted: usize = 0;
             while (self.total_weight > self.config.max_weight and evicted < self.config.items_to_prune) : (evicted += 1) {
-                const node = self.probation_list.pop() orelse self.protected_list.pop() orelse return;
+                const node = self.probation_list.pop() orelse self.protected_list.pop() orelse self.window_list.pop() orelse return;
                 const item: *Item = @fieldParentPtr("lru_node", node);
 
+                if (item.slru_is_window) {
+                    self.window_weight -|= item.weight;
+                }
                 if (item.slru_is_protected) {
                     self.protected_weight -|= item.weight;
                 }
+
+                item.promotions = 0;
+                item.slru_is_window = false;
+                item.slru_is_protected = false;
 
                 _ = self.store.delete(item.key);
                 item.markDead();
@@ -662,11 +772,32 @@ pub fn CacheUnmanaged(
             return candidate.lastAccessTick() < current.lastAccessTick();
         }
 
+        fn windowMaxWeight(self: *@This()) usize {
+            if (comptime stable_lru) {
+                const pct: usize = self.config.stable_lru_window_percent;
+                if (pct == 0) return 0;
+                const raw = (self.config.max_weight * pct) / 100;
+                return @max(raw, 1);
+            }
+            return 0;
+        }
+
+        fn mainMaxWeight(self: *@This()) usize {
+            if (comptime stable_lru) {
+                const window_max = self.windowMaxWeight();
+                return self.config.max_weight -| window_max;
+            }
+            return self.config.max_weight;
+        }
+
         fn protectedMaxWeight(self: *@This()) usize {
             if (comptime stable_lru) {
                 const pct: usize = self.config.stable_lru_protected_percent;
                 if (pct == 0) return 0;
-                return (self.config.max_weight * pct) / 100;
+                const main_max = self.mainMaxWeight();
+                if (main_max == 0) return 0;
+                const raw = (main_max * pct) / 100;
+                return @max(raw, 1);
             }
             return 0;
         }
@@ -679,6 +810,7 @@ pub fn CacheUnmanaged(
                     const item: *Item = @fieldParentPtr("lru_node", node);
 
                     item.promotions = 0;
+                    item.slru_is_window = false;
                     item.slru_is_protected = false;
                     self.protected_weight -|= item.weight;
                     self.probation_list.prepend(&item.lru_node);
@@ -686,9 +818,20 @@ pub fn CacheUnmanaged(
             }
         }
 
-        fn linkLruFront(self: *@This(), item: *Item) void {
+        fn linkWindowFront(self: *@This(), item: *Item) void {
             if (comptime stable_lru) {
                 item.promotions = 0;
+                item.slru_is_window = true;
+                item.slru_is_protected = false;
+                self.window_weight += item.weight;
+                self.window_list.prepend(&item.lru_node);
+            }
+        }
+
+        fn linkProbationFront(self: *@This(), item: *Item) void {
+            if (comptime stable_lru) {
+                item.promotions = 0;
+                item.slru_is_window = false;
                 item.slru_is_protected = false;
                 self.probation_list.prepend(&item.lru_node);
             }
@@ -696,22 +839,37 @@ pub fn CacheUnmanaged(
 
         fn unlinkLru(self: *@This(), item: *Item) void {
             if (comptime stable_lru) {
-                const list = if (item.slru_is_protected) &self.protected_list else &self.probation_list;
+                const list = if (item.slru_is_window)
+                    &self.window_list
+                else if (item.slru_is_protected)
+                    &self.protected_list
+                else
+                    &self.probation_list;
                 if (item.lru_node.prev != null or item.lru_node.next != null or list.first == &item.lru_node) {
                     list.remove(&item.lru_node);
                 }
 
+                if (item.slru_is_window) {
+                    self.window_weight -|= item.weight;
+                }
                 if (item.slru_is_protected) {
                     self.protected_weight -|= item.weight;
                 }
 
                 item.promotions = 0;
+                item.slru_is_window = false;
                 item.slru_is_protected = false;
             }
         }
 
         fn maybePromote(self: *@This(), item: *Item) void {
             if (comptime stable_lru) {
+                if (item.slru_is_window) {
+                    self.window_list.remove(&item.lru_node);
+                    self.window_list.prepend(&item.lru_node);
+                    return;
+                }
+
                 item.promotions += 1;
                 const threshold = @max(self.config.gets_per_promote, 1);
                 if (item.promotions < threshold) return;
@@ -725,6 +883,7 @@ pub fn CacheUnmanaged(
                 }
 
                 self.probation_list.remove(&item.lru_node);
+                item.slru_is_window = false;
                 item.slru_is_protected = true;
                 self.protected_weight += item.weight;
                 self.protected_list.prepend(&item.lru_node);
