@@ -9,15 +9,17 @@ const StableLhdCache = @import("cache.zig").StableLhdCache;
 
 const Config = @import("cache.zig").Config;
 
+const Key = []const u8;
+
 const Weigher10 = struct {
-    pub fn weigh(_: @This(), _: []const u8, _: *const u64) usize {
+    pub fn weigh(_: @This(), _: Key, _: *const u64) usize {
         return 10;
     }
 };
 
 test "set/get/delete roundtrip" {
     const alloc = std.testing.allocator;
-    var cache = try SampledLruCache(u64).init(alloc, Config{ .max_weight = 10_000 });
+    var cache = try SampledLruCache(Key, u64).init(alloc, Config{ .max_weight = 10_000 });
     defer cache.deinit();
 
     var item = try cache.set("a", 123, 60 * std.time.ns_per_s);
@@ -44,7 +46,7 @@ test "set/get/delete roundtrip" {
 
 test "get missing returns null" {
     const alloc = std.testing.allocator;
-    var cache = try SampledLruCache(u8).init(alloc, Config{ .max_weight = 10_000 });
+    var cache = try SampledLruCache(Key, u8).init(alloc, Config{ .max_weight = 10_000 });
     defer cache.deinit();
 
     try std.testing.expect(cache.get("missing") == null);
@@ -53,7 +55,7 @@ test "get missing returns null" {
 
 test "delete missing returns null" {
     const alloc = std.testing.allocator;
-    var cache = try SampledLruCache(u8).init(alloc, Config{ .max_weight = 10_000 });
+    var cache = try SampledLruCache(Key, u8).init(alloc, Config{ .max_weight = 10_000 });
     defer cache.deinit();
 
     try std.testing.expect(cache.delete("missing") == null);
@@ -61,7 +63,7 @@ test "delete missing returns null" {
 
 test "replace preserves ttl" {
     const alloc = std.testing.allocator;
-    var cache = try SampledLruCache(u8).init(alloc, Config{ .max_weight = 10_000 });
+    var cache = try SampledLruCache(Key, u8).init(alloc, Config{ .max_weight = 10_000 });
     defer cache.deinit();
 
     try std.testing.expect((try cache.replace("missing", 1)) == null);
@@ -88,7 +90,7 @@ test "replace preserves ttl" {
 
 test "sampled LHD evicts low density" {
     const alloc = std.testing.allocator;
-    var cache = try SampledLhdCache(u64, Weigher10).init(alloc, Config{ .max_weight = 30, .sample_size = 8, .enable_tiny_lfu = false });
+    var cache = try SampledLhdCache(Key, u64, Weigher10).init(alloc, Config{ .max_weight = 30, .sample_size = 8, .enable_tiny_lfu = false });
     defer cache.deinit();
 
     {
@@ -123,7 +125,7 @@ test "sampled LHD evicts low density" {
 
 test "stable LRU compiles and basic ops" {
     const alloc = std.testing.allocator;
-    var cache = try StableLruCache(u64).init(alloc, Config{ .max_weight = 18, .gets_per_promote = 2, .enable_tiny_lfu = false });
+    var cache = try StableLruCache(Key, u64).init(alloc, Config{ .max_weight = 18, .gets_per_promote = 2, .enable_tiny_lfu = false });
     defer cache.deinit();
 
     {
@@ -149,7 +151,7 @@ test "stable LRU compiles and basic ops" {
 
 test "stable LHD compiles and basic ops" {
     const alloc = std.testing.allocator;
-    var cache = try StableLhdCache(u64, Weigher10).init(alloc, Config{ .max_weight = 20, .sample_size = 8 });
+    var cache = try StableLhdCache(Key, u64, Weigher10).init(alloc, Config{ .max_weight = 20, .sample_size = 8 });
     defer cache.deinit();
 
     {
@@ -171,7 +173,7 @@ test "stable LHD compiles and basic ops" {
 
 test "tiny lfu rejects cold candidate" {
     const alloc = std.testing.allocator;
-    var cache = try SampledLruCacheWithWeigher(u64, Weigher10).init(alloc, Config{ .max_weight = 20, .sample_size = 8 });
+    var cache = try SampledLruCacheWithWeigher(Key, u64, Weigher10).init(alloc, Config{ .max_weight = 20, .sample_size = 8 });
     defer cache.deinit();
 
     {
@@ -210,7 +212,7 @@ test "tiny lfu rejects cold candidate" {
 test "stable LRU SLRU evicts probation first" {
     const alloc = std.testing.allocator;
 
-    var cache = try StableLruCacheWithWeigher(u64, Weigher10).init(
+    var cache = try StableLruCacheWithWeigher(Key, u64, Weigher10).init(
         alloc,
         Config{ .max_weight = 30, .gets_per_promote = 1, .stable_lru_protected_percent = 50, .enable_tiny_lfu = false },
     );
@@ -257,7 +259,7 @@ test "stable LRU SLRU evicts probation first" {
 
 test "tiny lfu admits frequent candidate" {
     const alloc = std.testing.allocator;
-    var cache = try SampledLruCacheWithWeigher(u64, Weigher10).init(alloc, Config{ .max_weight = 20, .sample_size = 8 });
+    var cache = try SampledLruCacheWithWeigher(Key, u64, Weigher10).init(alloc, Config{ .max_weight = 20, .sample_size = 8 });
     defer cache.deinit();
 
     {

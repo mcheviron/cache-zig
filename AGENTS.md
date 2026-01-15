@@ -21,6 +21,11 @@ Prefer the `Justfile` (it defines the intended workflows).
 - Run a single test: `just test-one "<filter>" [-- <zig test args...>]`
   - Direct: `zig test src/root.zig --test-filter "<filter>"`
 
+- View Zig standard library documentation locally:
+  - Start the documentation server by running: `just std`
+    - **Note:** Run this in a PTY (such as a terminal, not a background process) to ensure the documentation server starts and can accept interactive input if needed.
+  - This will print the address (e.g. `http://127.0.0.1:5000/`). Open this URL in your browser to view and search the standard library documentation.
+
 Notes:
 
 - All recipes accept extra Zig args, e.g. `just build -Doptimize=ReleaseSafe`.
@@ -155,5 +160,5 @@ In all cache-owned/returned types in both `multi_threaded` and `single_threaded`
 
 ## References
 
-- https://ziglang.org/documentation/master/std/
+- To run and browse local stdlib documentation: `zig std` (see CLI output for the web address)
 - https://www.openmymind.net/

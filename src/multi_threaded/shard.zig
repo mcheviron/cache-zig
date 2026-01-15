@@ -1,11 +1,16 @@
 const std = @import("std");
 
-pub fn Shard(comptime ItemPtr: type) type {
+pub fn Shard(comptime K: type, comptime ItemPtr: type, comptime Context: type) type {
     return struct {
         lock: std.Thread.RwLock = .{},
-        map: std.StringHashMapUnmanaged(ItemPtr) = .{},
+        map: std.hash_map.HashMapUnmanaged(K, ItemPtr, Context, 80) = .{},
         items: std.ArrayListUnmanaged(ItemPtr) = .{},
-        pos: std.StringHashMapUnmanaged(usize) = .{},
+        pos: std.hash_map.HashMapUnmanaged(K, usize, Context, 80) = .{},
+        ctx: Context,
+
+        pub fn init(ctx: Context) @This() {
+            return .{ .ctx = ctx };
+        }
 
         pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
             self.lock.lock();
@@ -22,52 +27,53 @@ pub fn Shard(comptime ItemPtr: type) type {
             return self.items.items.len;
         }
 
-        pub fn get(self: *@This(), key: []const u8) ?ItemPtr {
+        pub fn get(self: *@This(), key: K) ?ItemPtr {
             self.lock.lockShared();
             defer self.lock.unlockShared();
-            return self.map.get(key);
+            return self.map.getContext(key, self.ctx);
         }
 
-        pub fn set(self: *@This(), allocator: std.mem.Allocator, key: []const u8, item: ItemPtr) !?ItemPtr {
+        pub fn set(self: *@This(), allocator: std.mem.Allocator, key: K, item: ItemPtr) !?ItemPtr {
             self.lock.lock();
             defer self.lock.unlock();
 
-            // IMPORTANT: StringHashMapUnmanaged stores the key slice as-is.
-            // Keys are owned by `Item.key`, so on overwrite we must remove+reinsert
-            // to avoid the map holding a pointer to freed key bytes.
-            if (self.map.fetchRemove(key)) |removed| {
+            // IMPORTANT: the map stores keys by value.
+            // If `K` contains pointer/slice fields (e.g. `[]const u8`), a replace can
+            // change the backing allocation. On overwrite, remove+reinsert so the
+            // map's stored key stays tied to the new item's owned key.
+            if (self.map.fetchRemoveContext(key, self.ctx)) |removed| {
                 const old = removed.value;
-                const idx = (self.pos.fetchRemove(key) orelse unreachable).value;
+                const idx = (self.pos.fetchRemoveContext(key, self.ctx) orelse unreachable).value;
 
-                try self.map.put(allocator, item.key, item);
+                try self.map.putContext(allocator, item.key, item, self.ctx);
                 self.items.items[idx] = item;
-                try self.pos.put(allocator, item.key, idx);
+                try self.pos.putContext(allocator, item.key, idx, self.ctx);
 
                 return old;
             }
 
-            try self.map.put(allocator, item.key, item);
-            try self.pos.put(allocator, item.key, self.items.items.len);
+            try self.map.putContext(allocator, item.key, item, self.ctx);
+            try self.pos.putContext(allocator, item.key, self.items.items.len, self.ctx);
             try self.items.append(allocator, item);
             return null;
         }
 
-        pub fn delete(self: *@This(), allocator: std.mem.Allocator, key: []const u8) ?ItemPtr {
+        pub fn delete(self: *@This(), allocator: std.mem.Allocator, key: K) ?ItemPtr {
             self.lock.lock();
             defer self.lock.unlock();
 
-            const removed = self.map.fetchRemove(key) orelse return null;
+            const removed = self.map.fetchRemoveContext(key, self.ctx) orelse return null;
             const old = removed.value;
 
-            const idx = (self.pos.fetchRemove(key) orelse unreachable).value;
+            const idx = (self.pos.fetchRemoveContext(key, self.ctx) orelse unreachable).value;
             const last_idx = self.items.items.len - 1;
 
             if (idx != last_idx) {
                 const swapped = self.items.items[last_idx];
                 self.items.items[idx] = swapped;
                 // Update swapped key index.
-                _ = self.pos.fetchRemove(swapped.key);
-                self.pos.put(allocator, swapped.key, idx) catch unreachable;
+                _ = self.pos.fetchRemoveContext(swapped.key, self.ctx);
+                self.pos.putContext(allocator, swapped.key, idx, self.ctx) catch unreachable;
             }
 
             self.items.items.len = last_idx;
@@ -77,26 +83,26 @@ pub fn Shard(comptime ItemPtr: type) type {
         pub fn deleteIfSame(
             self: *@This(),
             allocator: std.mem.Allocator,
-            key: []const u8,
+            key: K,
             expected: ItemPtr,
         ) ?ItemPtr {
             self.lock.lock();
             defer self.lock.unlock();
 
-            const current = self.map.get(key) orelse return null;
+            const current = self.map.getContext(key, self.ctx) orelse return null;
             if (current != expected) return null;
 
-            const removed = self.map.fetchRemove(key) orelse return null;
+            const removed = self.map.fetchRemoveContext(key, self.ctx) orelse return null;
             const old = removed.value;
 
-            const idx = (self.pos.fetchRemove(key) orelse unreachable).value;
+            const idx = (self.pos.fetchRemoveContext(key, self.ctx) orelse unreachable).value;
             const last_idx = self.items.items.len - 1;
 
             if (idx != last_idx) {
                 const swapped = self.items.items[last_idx];
                 self.items.items[idx] = swapped;
-                _ = self.pos.fetchRemove(swapped.key);
-                self.pos.put(allocator, swapped.key, idx) catch unreachable;
+                _ = self.pos.fetchRemoveContext(swapped.key, self.ctx);
+                self.pos.putContext(allocator, swapped.key, idx, self.ctx) catch unreachable;
             }
 
             self.items.items.len = last_idx;

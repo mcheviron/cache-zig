@@ -1,10 +1,10 @@
 const std = @import("std");
 
-pub fn Item(comptime V: type, comptime stable_lru: bool) type {
+pub fn Item(comptime K: type, comptime V: type, comptime stable_lru: bool, comptime KeyOps: type) type {
     return struct {
         const Self = @This();
 
-        key: []u8,
+        key: K,
         value: V,
         weight: usize,
 
@@ -20,9 +20,9 @@ pub fn Item(comptime V: type, comptime stable_lru: bool) type {
         promotions: if (stable_lru) usize else void = if (stable_lru) 0 else {},
         slru_is_protected: if (stable_lru) bool else void = if (stable_lru) false else {},
 
-        pub fn create(allocator: std.mem.Allocator, key: []const u8, value: V, ttl_ns: u64, weight: usize) !*Self {
-            const owned_key = try allocator.dupe(u8, key);
-            errdefer allocator.free(owned_key);
+        pub fn create(allocator: std.mem.Allocator, key: K, value: V, ttl_ns: u64, weight: usize) !*Self {
+            var owned_key = try KeyOps.clone(allocator, key);
+            errdefer KeyOps.deinit(allocator, &owned_key);
 
             const item = try allocator.create(Self);
             item.* = .{
@@ -41,7 +41,7 @@ pub fn Item(comptime V: type, comptime stable_lru: bool) type {
         pub fn release(self: *Self, allocator: std.mem.Allocator) void {
             self.ref_count -= 1;
             if (self.ref_count == 0) {
-                allocator.free(self.key);
+                KeyOps.deinit(allocator, &self.key);
                 maybeDeinitValue(allocator, &self.value);
                 allocator.destroy(self);
             }

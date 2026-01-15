@@ -17,3 +17,6 @@ test *args:
 
 test-one filter *args:
     zig test src/root.zig --test-filter "$filter" "$@"
+
+std:
+    zig std

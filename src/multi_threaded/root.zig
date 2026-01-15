@@ -12,42 +12,42 @@ fn guard() void {
     }
 }
 
-pub fn CacheUnmanaged(comptime V: type, comptime policy: Policy, comptime Weigher: type) type {
+pub fn CacheUnmanaged(comptime K: type, comptime V: type, comptime policy: Policy, comptime Weigher: type) type {
     guard();
-    return CacheImpl.CacheUnmanaged(V, policy, Weigher);
+    return CacheImpl.CacheUnmanaged(K, V, policy, Weigher);
 }
 
-pub fn Cache(comptime V: type, comptime policy: Policy, comptime Weigher: type) type {
+pub fn Cache(comptime K: type, comptime V: type, comptime policy: Policy, comptime Weigher: type) type {
     guard();
-    return CacheImpl.Cache(V, policy, Weigher);
+    return CacheImpl.Cache(K, V, policy, Weigher);
 }
 
-pub fn SampledLruCache(comptime V: type) type {
+pub fn SampledLruCache(comptime K: type, comptime V: type) type {
     guard();
-    return CacheImpl.SampledLruCache(V);
+    return CacheImpl.SampledLruCache(K, V);
 }
 
-pub fn SampledLruCacheWithWeigher(comptime V: type, comptime Weigher: type) type {
+pub fn SampledLruCacheWithWeigher(comptime K: type, comptime V: type, comptime Weigher: type) type {
     guard();
-    return CacheImpl.SampledLruCacheWithWeigher(V, Weigher);
+    return CacheImpl.SampledLruCacheWithWeigher(K, V, Weigher);
 }
 
-pub fn SampledLhdCache(comptime V: type, comptime Weigher: type) type {
+pub fn SampledLhdCache(comptime K: type, comptime V: type, comptime Weigher: type) type {
     guard();
-    return CacheImpl.SampledLhdCache(V, Weigher);
+    return CacheImpl.SampledLhdCache(K, V, Weigher);
 }
 
-pub fn StableLruCache(comptime V: type) type {
+pub fn StableLruCache(comptime K: type, comptime V: type) type {
     guard();
-    return CacheImpl.StableLruCache(V);
+    return CacheImpl.StableLruCache(K, V);
 }
 
-pub fn StableLruCacheWithWeigher(comptime V: type, comptime Weigher: type) type {
+pub fn StableLruCacheWithWeigher(comptime K: type, comptime V: type, comptime Weigher: type) type {
     guard();
-    return CacheImpl.StableLruCacheWithWeigher(V, Weigher);
+    return CacheImpl.StableLruCacheWithWeigher(K, V, Weigher);
 }
 
-pub fn StableLhdCache(comptime V: type, comptime Weigher: type) type {
+pub fn StableLhdCache(comptime K: type, comptime V: type, comptime Weigher: type) type {
     guard();
-    return CacheImpl.StableLhdCache(V, Weigher);
+    return CacheImpl.StableLhdCache(K, V, Weigher);
 }

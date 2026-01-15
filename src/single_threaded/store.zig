@@ -1,9 +1,10 @@
 const std = @import("std");
 
-pub fn Store(comptime ItemT: type) type {
+pub fn Store(comptime K: type, comptime ItemT: type, comptime Context: type) type {
     return struct {
-        map: std.StringHashMapUnmanaged(*ItemT) = .{},
+        map: std.hash_map.HashMapUnmanaged(K, *ItemT, Context, 80) = .{},
         items: std.ArrayListUnmanaged(*ItemT) = .{},
+        ctx: Context,
 
         pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
             var it = self.map.iterator();
@@ -19,17 +20,21 @@ pub fn Store(comptime ItemT: type) type {
             return self.items.items.len;
         }
 
-        pub fn get(self: *@This(), key: []const u8) ?*ItemT {
-            return self.map.get(key);
+        pub fn init(ctx: Context) @This() {
+            return .{ .ctx = ctx };
+        }
+
+        pub fn get(self: *@This(), key: K) ?*ItemT {
+            return self.map.getContext(key, self.ctx);
         }
 
         pub fn put(self: *@This(), allocator: std.mem.Allocator, item: *ItemT) !?*ItemT {
-            const old_kv = self.map.fetchRemove(item.key);
+            const old_kv = self.map.fetchRemoveContext(item.key, self.ctx);
             if (old_kv) |kv| {
                 self.swapRemoveItem(kv.value);
             }
 
-            const gop = try self.map.getOrPut(allocator, item.key);
+            const gop = try self.map.getOrPutContext(allocator, item.key, self.ctx);
             std.debug.assert(!gop.found_existing);
             gop.key_ptr.* = item.key;
             gop.value_ptr.* = item;
@@ -41,8 +46,8 @@ pub fn Store(comptime ItemT: type) type {
             return null;
         }
 
-        pub fn delete(self: *@This(), key: []const u8) ?*ItemT {
-            const kv = self.map.fetchRemove(key) orelse return null;
+        pub fn delete(self: *@This(), key: K) ?*ItemT {
+            const kv = self.map.fetchRemoveContext(key, self.ctx) orelse return null;
             const item = kv.value;
             self.swapRemoveItem(item);
             return item;

@@ -4,17 +4,18 @@ const Config = @import("../config.zig").Config;
 const Policy = @import("../policy.zig").Policy;
 const weigher_mod = @import("../weigher.zig");
 const FrequencySketch = @import("../frequency_sketch.zig").FrequencySketch;
+const key_context = @import("../key_context.zig");
+const key_ops = @import("../key_ops.zig");
 const ItemMod = @import("item.zig");
 const ShardMod = @import("shard.zig");
 
-fn hashKey(key: []const u8) u64 {
-    var h = std.hash.Fnv1a_64.init();
-    h.update(key);
-    return h.final();
+fn shardIndex(hash: u64, mask: usize) usize {
+    return @as(usize, @intCast(hash)) & mask;
 }
 
-fn shardIndex(key: []const u8, mask: usize) usize {
-    return @as(usize, @intCast(hashKey(key))) & mask;
+fn isByteSlice(comptime K: type) bool {
+    const info = @typeInfo(K);
+    return info == .pointer and info.pointer.size == .slice and info.pointer.child == u8;
 }
 
 fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
@@ -24,21 +25,24 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
 
     return struct {
         const Self = @This();
+        const K = CacheT.Key;
+        const Context = CacheT.KeyContext;
         const Item = CacheT.Item;
 
         const StableSlru = struct {
             const Entry = struct {
                 node: std.DoublyLinkedList.Node = .{},
-                key: []const u8,
+                key: K,
                 item: *Item,
                 promotions: usize = 0,
                 is_protected: bool = false,
             };
 
+            ctx: Context = .{},
             probation: std.DoublyLinkedList = .{},
             protected: std.DoublyLinkedList = .{},
             protected_weight: usize = 0,
-            index: std.StringHashMapUnmanaged(*Entry) = .{},
+            index: std.hash_map.HashMapUnmanaged(K, *Entry, Context, 80) = .{},
 
             fn deinit(self: *StableSlru, allocator: std.mem.Allocator) void {
                 self.clear(allocator);
@@ -48,14 +52,14 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
             fn clear(self: *StableSlru, allocator: std.mem.Allocator) void {
                 while (self.probation.pop()) |n| {
                     const entry: *Entry = @fieldParentPtr("node", n);
-                    _ = self.index.fetchRemove(entry.key);
+                    _ = self.index.fetchRemoveContext(entry.key, self.ctx);
                     entry.item.release(allocator);
                     allocator.destroy(entry);
                 }
 
                 while (self.protected.pop()) |n| {
                     const entry: *Entry = @fieldParentPtr("node", n);
-                    _ = self.index.fetchRemove(entry.key);
+                    _ = self.index.fetchRemoveContext(entry.key, self.ctx);
                     entry.item.release(allocator);
                     allocator.destroy(entry);
                 }
@@ -86,7 +90,11 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
             fn upsert(self: *StableSlru, allocator: std.mem.Allocator, item: *Item, max_weight: usize, protected_percent: u8) !void {
                 const key = item.key;
 
-                if (self.index.get(key)) |entry| {
+                if (self.index.getContext(key, self.ctx)) |entry| {
+                    // Remove+reinsert so the map never points at freed key memory.
+                    const old_key = entry.key;
+                    _ = self.index.fetchRemoveContext(old_key, self.ctx);
+
                     if (entry.is_protected) {
                         self.protected_weight -|= entry.item.weight;
                         self.protected_weight += item.weight;
@@ -95,20 +103,16 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
 
                     entry.item.release(allocator);
                     entry.item = item;
+                    entry.key = key;
                     entry.promotions = 0;
 
-                    if (entry.key.ptr != key.ptr) {
-                        _ = self.index.fetchRemove(entry.key);
-                        entry.key = key;
-                        try self.index.put(allocator, entry.key, entry);
-                    }
-
+                    try self.index.putContext(allocator, entry.key, entry, self.ctx);
                     return;
                 }
 
                 const entry = try allocator.create(Entry);
                 entry.* = .{ .key = key, .item = item, .promotions = 0, .is_protected = false };
-                try self.index.put(allocator, entry.key, entry);
+                try self.index.putContext(allocator, entry.key, entry, self.ctx);
                 self.probation.prepend(&entry.node);
             }
 
@@ -116,10 +120,16 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
                 const key = item.key;
                 const threshold = @max(gets_per_promote, 1);
 
-                const entry = self.index.get(key) orelse {
+                const entry = self.index.getContext(key, self.ctx) orelse {
                     try self.upsert(allocator, item, max_weight, protected_percent);
                     return;
                 };
+
+                // Remove+reinsert to keep map key tied to current owned key.
+                const old_key = entry.key;
+                _ = self.index.fetchRemoveContext(old_key, self.ctx);
+                entry.key = key;
+                try self.index.putContext(allocator, entry.key, entry, self.ctx);
 
                 entry.item.release(allocator);
                 entry.item = item;
@@ -139,19 +149,13 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
                     self.protected.prepend(&entry.node);
                     self.ensureProtectedLimit(max_weight, protected_percent);
                 }
-
-                if (entry.key.ptr != key.ptr) {
-                    _ = self.index.fetchRemove(entry.key);
-                    entry.key = key;
-                    try self.index.put(allocator, entry.key, entry);
-                }
             }
 
             fn removeIfSame(self: *StableSlru, allocator: std.mem.Allocator, item: *Item) void {
-                const entry = self.index.get(item.key) orelse return;
+                const entry = self.index.getContext(item.key, self.ctx) orelse return;
                 if (entry.item != item) return;
 
-                _ = self.index.fetchRemove(entry.key);
+                _ = self.index.fetchRemoveContext(entry.key, self.ctx);
                 if (entry.is_protected) {
                     self.protected.remove(&entry.node);
                     self.protected_weight -|= entry.item.weight;
@@ -163,7 +167,7 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
                 allocator.destroy(entry);
             }
 
-            const Pop = struct { key: []const u8, item: *Item };
+            const Pop = struct { key: K, item: *Item };
 
             fn popProbationLruEntry(self: *StableSlru) ?*Entry {
                 const node = self.probation.pop() orelse return null;
@@ -173,7 +177,7 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
             fn popEvictionVictim(self: *StableSlru, allocator: std.mem.Allocator) ?Pop {
                 const node = self.probation.pop() orelse self.protected.pop() orelse return null;
                 const entry: *Entry = @fieldParentPtr("node", node);
-                _ = self.index.fetchRemove(entry.key);
+                _ = self.index.fetchRemoveContext(entry.key, self.ctx);
 
                 if (entry.is_protected) {
                     self.protected_weight -|= entry.item.weight;
@@ -503,7 +507,7 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
         fn evictItemFromCache(self: *Self, item: *Item) void {
             item.markDead();
 
-            const shard = &self.cache.shards[shardIndex(item.key, self.cache.shard_mask)];
+            const shard = &self.cache.shards[shardIndex(self.cache.ctx.hash(item.key), self.cache.shard_mask)];
             if (shard.deleteIfSame(self.allocator, item.key, item)) |removed| {
                 _ = self.cache.total_weight.fetchSub(removed.weight, .acq_rel);
                 removed.release(self.allocator);
@@ -520,7 +524,7 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
             }
 
             self.cache.sketch_lock.lock();
-            const candidate_freq: u32 = self.cache.frequency_sketch.frequency(hashKey(candidate.key));
+            const candidate_freq: u32 = self.cache.frequency_sketch.frequency(self.cache.ctx.hash(candidate.key));
             self.cache.sketch_lock.unlock();
 
             const max_victims: usize = 8;
@@ -534,7 +538,7 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
                 const entry: *StableSlru.Entry = self.lru.popProbationLruEntry() orelse break;
 
                 self.cache.sketch_lock.lock();
-                const freq: u32 = self.cache.frequency_sketch.frequency(hashKey(entry.key));
+                const freq: u32 = self.cache.frequency_sketch.frequency(self.cache.ctx.hash(entry.key));
                 self.cache.sketch_lock.unlock();
 
                 victims.appendBounded(entry) catch {
@@ -578,7 +582,7 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
             }
 
             self.cache.sketch_lock.lock();
-            const candidate_freq: u32 = self.cache.frequency_sketch.frequency(hashKey(candidate.key));
+            const candidate_freq: u32 = self.cache.frequency_sketch.frequency(self.cache.ctx.hash(candidate.key));
             self.cache.sketch_lock.unlock();
 
             const max_victims: usize = 8;
@@ -600,7 +604,7 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
                 }
 
                 self.cache.sketch_lock.lock();
-                const freq: u32 = self.cache.frequency_sketch.frequency(hashKey(victim.key));
+                const freq: u32 = self.cache.frequency_sketch.frequency(self.cache.ctx.hash(victim.key));
                 self.cache.sketch_lock.unlock();
 
                 victims.appendBounded(victim) catch {
@@ -635,7 +639,7 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
 
                     pop.item.markDead();
 
-                    const shard = &self.cache.shards[shardIndex(pop.key, self.cache.shard_mask)];
+                    const shard = &self.cache.shards[shardIndex(self.cache.ctx.hash(pop.key), self.cache.shard_mask)];
                     if (shard.deleteIfSame(self.allocator, pop.key, pop.item)) |removed| {
                         _ = self.cache.total_weight.fetchSub(removed.weight, .acq_rel);
                         removed.release(self.allocator);
@@ -646,7 +650,7 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
 
                     candidate.markDead();
 
-                    const shard = &self.cache.shards[shardIndex(candidate.key, self.cache.shard_mask)];
+                    const shard = &self.cache.shards[shardIndex(self.cache.ctx.hash(candidate.key), self.cache.shard_mask)];
                     if (shard.deleteIfSame(self.allocator, candidate.key, candidate)) |removed| {
                         _ = self.cache.total_weight.fetchSub(removed.weight, .acq_rel);
                         removed.release(self.allocator);
@@ -660,16 +664,21 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
 }
 
 pub fn CacheUnmanaged(
+    comptime K: type,
     comptime V: type,
     comptime policy: Policy,
     comptime Weigher: type,
 ) type {
-    const ItemT = ItemMod.Item(V);
-    const ShardT = ShardMod.Shard(*ItemT);
+    const Context = key_context.AutoContext(K);
+    const KeyOps = key_ops.Auto(K);
+
+    const ItemT = ItemMod.Item(K, V, KeyOps);
+    const ShardT = ShardMod.Shard(K, *ItemT, Context);
 
     return struct {
         config: Config,
         weigher: Weigher,
+        ctx: Context = .{},
         shard_mask: usize,
         shards: []ShardT,
 
@@ -682,17 +691,21 @@ pub fn CacheUnmanaged(
 
         worker: if (policy.isStable()) ?*StableWorker(@This(), policy) else void = if (policy.isStable()) null else {},
 
+        pub const Key = K;
+        pub const KeyContext = Context;
+
         pub fn init(allocator: std.mem.Allocator, config_in: Config, weigher: Weigher) InitError!@This() {
-            comptime validateWeigher(V, Weigher);
+            comptime validateWeigher(K, V, Weigher);
 
             const cfg = try config_in.build();
 
             const shards = try allocator.alloc(ShardT, cfg.shard_count);
-            for (shards) |*s| s.* = .{};
+            for (shards) |*s| s.* = ShardT.init(.{});
 
             var out: @This() = .{
                 .config = cfg,
                 .weigher = weigher,
+                .ctx = .{},
                 .shard_mask = cfg.shard_count - 1,
                 .shards = shards,
             };
@@ -726,14 +739,14 @@ pub fn CacheUnmanaged(
             allocator.free(self.shards);
         }
 
-        pub fn get(self: *@This(), allocator: std.mem.Allocator, key: []const u8) ?ItemRef {
+        pub fn get(self: *@This(), allocator: std.mem.Allocator, key: K) ?ItemRef {
             if (self.config.enable_tiny_lfu) {
                 self.sketch_lock.lock();
-                self.frequency_sketch.increment(hashKey(key));
+                self.frequency_sketch.increment(self.ctx.hash(key));
                 self.sketch_lock.unlock();
             }
 
-            const shard = &self.shards[shardIndex(key, self.shard_mask)];
+            const shard = &self.shards[shardIndex(self.ctx.hash(key), self.shard_mask)];
             const item = shard.get(key) orelse return null;
 
             item.retain();
@@ -753,8 +766,8 @@ pub fn CacheUnmanaged(
             return .{ .item = item, .allocator = allocator };
         }
 
-        pub fn peek(self: *@This(), allocator: std.mem.Allocator, key: []const u8) ?ItemRef {
-            const shard = &self.shards[shardIndex(key, self.shard_mask)];
+        pub fn peek(self: *@This(), allocator: std.mem.Allocator, key: K) ?ItemRef {
+            const shard = &self.shards[shardIndex(self.ctx.hash(key), self.shard_mask)];
             const item = shard.get(key) orelse return null;
             item.retain();
 
@@ -766,7 +779,7 @@ pub fn CacheUnmanaged(
             return .{ .item = item, .allocator = allocator };
         }
 
-        pub fn set(self: *@This(), allocator: std.mem.Allocator, key: []const u8, value: V, ttl_ns: u64) !ItemRef {
+        pub fn set(self: *@This(), allocator: std.mem.Allocator, key: K, value: V, ttl_ns: u64) !ItemRef {
             const weight = self.weigh(key, &value);
             const item = try ItemT.create(allocator, key, value, ttl_ns, weight);
             const tick = self.nextTick();
@@ -776,7 +789,7 @@ pub fn CacheUnmanaged(
             // Shard owns one ref.
             item.retain();
 
-            const shard = &self.shards[shardIndex(key, self.shard_mask)];
+            const shard = &self.shards[shardIndex(self.ctx.hash(item.key), self.shard_mask)];
             const old = try shard.set(allocator, item.key, item);
             const replaced = old != null;
             if (old) |old_item| {
@@ -793,7 +806,7 @@ pub fn CacheUnmanaged(
                 self.worker.?.enqueueEvict();
             } else {
                 if (self.config.enable_tiny_lfu and !replaced) {
-                    const candidate_hash = hashKey(key);
+                    const candidate_hash = self.ctx.hash(item.key);
                     _ = self.applyTinyLfuAdmission(allocator, item, candidate_hash);
                 }
                 try self.evictIfNeeded(allocator);
@@ -802,7 +815,7 @@ pub fn CacheUnmanaged(
             return .{ .item = item, .allocator = allocator };
         }
 
-        pub fn replace(self: *@This(), allocator: std.mem.Allocator, key: []const u8, value: V) !?ItemRef {
+        pub fn replace(self: *@This(), allocator: std.mem.Allocator, key: K, value: V) !?ItemRef {
             const existing = self.peekRaw(allocator, key) orelse return null;
             defer existing.deinit();
 
@@ -810,8 +823,8 @@ pub fn CacheUnmanaged(
             return try self.set(allocator, key, value, ttl);
         }
 
-        pub fn delete(self: *@This(), allocator: std.mem.Allocator, key: []const u8) ?ItemRef {
-            const shard = &self.shards[shardIndex(key, self.shard_mask)];
+        pub fn delete(self: *@This(), allocator: std.mem.Allocator, key: K) ?ItemRef {
+            const shard = &self.shards[shardIndex(self.ctx.hash(key), self.shard_mask)];
             const item = shard.delete(allocator, key) orelse return null;
 
             if (comptime policy.isStable()) {
@@ -858,7 +871,7 @@ pub fn CacheUnmanaged(
             return self.len() == 0;
         }
 
-        pub fn extend(self: *@This(), allocator: std.mem.Allocator, key: []const u8, ttl_ns: u64) bool {
+        pub fn extend(self: *@This(), allocator: std.mem.Allocator, key: K, ttl_ns: u64) bool {
             const ref = self.peekRaw(allocator, key) orelse return false;
             defer ref.deinit();
 
@@ -867,8 +880,8 @@ pub fn CacheUnmanaged(
             return true;
         }
 
-        fn peekRaw(self: *@This(), allocator: std.mem.Allocator, key: []const u8) ?ItemRef {
-            const shard = &self.shards[shardIndex(key, self.shard_mask)];
+        fn peekRaw(self: *@This(), allocator: std.mem.Allocator, key: K) ?ItemRef {
+            const shard = &self.shards[shardIndex(self.ctx.hash(key), self.shard_mask)];
             const item = shard.get(key) orelse return null;
             item.retain();
             return .{ .item = item, .allocator = allocator };
@@ -928,7 +941,15 @@ pub fn CacheUnmanaged(
                 self.item.release(self.allocator);
             }
 
-            pub fn key(self: ItemRef) []const u8 {
+            /// Returns the cache key.
+            ///
+            /// Keys are logically immutable once inserted.
+            /// - For value keys, this returns a copy.
+            /// - For slice keys, this returns a read-only view into cache-owned
+            ///   memory that remains valid while this `ItemRef` is alive.
+            ///
+            /// Do not mutate the returned key (e.g. via `@constCast`).
+            pub fn key(self: ItemRef) K {
                 return self.item.key;
             }
 
@@ -949,9 +970,9 @@ pub fn CacheUnmanaged(
             }
         };
 
-        fn validateWeigher(comptime V_check: type, comptime Weigher_check: type) void {
+        fn validateWeigher(comptime K_check: type, comptime V_check: type, comptime Weigher_check: type) void {
             if (!@hasDecl(Weigher_check, "weigh")) {
-                @compileError("Weigher must declare pub fn weigh(self: Weigher, key: []const u8, value: *const V) usize");
+                @compileError("Weigher must declare pub fn weigh(self: Weigher, key: K, value: *const V) usize");
             }
 
             const fn_info = switch (@typeInfo(@TypeOf(Weigher_check.weigh))) {
@@ -970,8 +991,8 @@ pub fn CacheUnmanaged(
             }
 
             const p1 = params[1].type orelse @compileError("Weigher.weigh missing key type");
-            if (p1 != []const u8) {
-                @compileError("Weigher.weigh key parameter must be []const u8");
+            if (p1 != K_check) {
+                @compileError("Weigher.weigh key parameter must be K");
             }
 
             const p2 = params[2].type orelse @compileError("Weigher.weigh missing value type");
@@ -987,7 +1008,7 @@ pub fn CacheUnmanaged(
 
         fn validateFilterPredicate(comptime PredContext: type) void {
             if (!@hasDecl(PredContext, "pred")) {
-                @compileError("filter() predicate must declare pub fn pred(self: PredContext, key: []const u8, value: *const V) bool");
+                @compileError("filter() predicate must declare pub fn pred(self: PredContext, key: K, value: *const V) bool");
             }
 
             const fn_info = switch (@typeInfo(@TypeOf(PredContext.pred))) {
@@ -1006,8 +1027,8 @@ pub fn CacheUnmanaged(
             }
 
             const p1 = params[1].type orelse @compileError("filter() predicate missing key type");
-            if (p1 != []const u8) {
-                @compileError("filter() predicate key parameter must be []const u8");
+            if (p1 != K) {
+                @compileError("filter() predicate key parameter must be K");
             }
 
             const p2 = params[2].type orelse @compileError("filter() predicate missing value type");
@@ -1021,7 +1042,7 @@ pub fn CacheUnmanaged(
             }
         }
 
-        fn weigh(self: *@This(), key: []const u8, value: *const V) usize {
+        fn weigh(self: *@This(), key: K, value: *const V) usize {
             return self.weigher.weigh(key, value);
         }
 
@@ -1204,7 +1225,7 @@ pub fn CacheUnmanaged(
                 }
 
                 self.sketch_lock.lock();
-                const freq: u32 = self.frequency_sketch.frequency(hashKey(victim.key));
+                const freq: u32 = self.frequency_sketch.frequency(self.ctx.hash(victim.key));
                 self.sketch_lock.unlock();
 
                 victims.appendBounded(victim) catch {
@@ -1230,7 +1251,7 @@ pub fn CacheUnmanaged(
         fn evictCandidate(self: *@This(), allocator: std.mem.Allocator, candidate: *ItemT) void {
             candidate.markDead();
 
-            const shard = &self.shards[shardIndex(candidate.key, self.shard_mask)];
+            const shard = &self.shards[shardIndex(self.ctx.hash(candidate.key), self.shard_mask)];
             if (shard.deleteIfSame(allocator, candidate.key, candidate)) |removed| {
                 _ = self.total_weight.fetchSub(removed.weight, .acq_rel);
                 removed.release(allocator);
@@ -1241,7 +1262,7 @@ pub fn CacheUnmanaged(
             for (victims) |victim| {
                 victim.markDead();
 
-                const shard = &self.shards[shardIndex(victim.key, self.shard_mask)];
+                const shard = &self.shards[shardIndex(self.ctx.hash(victim.key), self.shard_mask)];
                 if (shard.deleteIfSame(allocator, victim.key, victim)) |removed| {
                     _ = self.total_weight.fetchSub(removed.weight, .acq_rel);
                     removed.release(allocator);
@@ -1266,7 +1287,7 @@ pub fn CacheUnmanaged(
 
                 candidate.markDead();
 
-                const shard = &self.shards[shardIndex(candidate.key, self.shard_mask)];
+                const shard = &self.shards[shardIndex(self.ctx.hash(candidate.key), self.shard_mask)];
                 if (shard.deleteIfSame(allocator, candidate.key, candidate)) |removed| {
                     _ = self.total_weight.fetchSub(removed.weight, .acq_rel);
                     removed.release(allocator);
@@ -1297,11 +1318,12 @@ pub fn CacheUnmanaged(
 /// defer get_ref.deinit();
 /// ```
 pub fn Cache(
+    comptime K: type,
     comptime V: type,
     comptime policy: Policy,
     comptime Weigher: type,
 ) type {
-    const Unmanaged = CacheUnmanaged(V, policy, Weigher);
+    const Unmanaged = CacheUnmanaged(K, V, policy, Weigher);
 
     return struct {
         unmanaged: Unmanaged,
@@ -1329,27 +1351,27 @@ pub fn Cache(
         }
 
         /// Returns an `ItemRef` for `key` and records a cache hit.
-        pub fn get(self: *@This(), key: []const u8) ?Unmanaged.ItemRef {
+        pub fn get(self: *@This(), key: K) ?Unmanaged.ItemRef {
             return self.unmanaged.get(self.allocator, key);
         }
 
         /// Returns an `ItemRef` for `key` without recording a hit.
-        pub fn peek(self: *@This(), key: []const u8) ?Unmanaged.ItemRef {
+        pub fn peek(self: *@This(), key: K) ?Unmanaged.ItemRef {
             return self.unmanaged.peek(self.allocator, key);
         }
 
         /// Inserts `key` → `value` with TTL and returns an `ItemRef`.
-        pub fn set(self: *@This(), key: []const u8, value: V, ttl_ns: u64) !Unmanaged.ItemRef {
+        pub fn set(self: *@This(), key: K, value: V, ttl_ns: u64) !Unmanaged.ItemRef {
             return self.unmanaged.set(self.allocator, key, value, ttl_ns);
         }
 
         /// Replaces the value for an existing key (preserving TTL).
-        pub fn replace(self: *@This(), key: []const u8, value: V) !?Unmanaged.ItemRef {
+        pub fn replace(self: *@This(), key: K, value: V) !?Unmanaged.ItemRef {
             return self.unmanaged.replace(self.allocator, key, value);
         }
 
         /// Deletes an item and returns its `ItemRef`.
-        pub fn delete(self: *@This(), key: []const u8) ?Unmanaged.ItemRef {
+        pub fn delete(self: *@This(), key: K) ?Unmanaged.ItemRef {
             return self.unmanaged.delete(self.allocator, key);
         }
 
@@ -1379,7 +1401,7 @@ pub fn Cache(
         }
 
         /// Extends an item's TTL by `ttl_ns`.
-        pub fn extend(self: *@This(), key: []const u8, ttl_ns: u64) bool {
+        pub fn extend(self: *@This(), key: K, ttl_ns: u64) bool {
             return self.unmanaged.extend(self.allocator, key, ttl_ns);
         }
 
@@ -1426,26 +1448,28 @@ pub fn Cache(
     };
 }
 
-pub fn SampledLruCache(comptime V: type) type {
-    return Cache(V, .sampled_lru, weigher_mod.Bytes(V));
+pub fn SampledLruCache(comptime K: type, comptime V: type) type {
+    const Weigher = if (comptime isByteSlice(K)) weigher_mod.Bytes(K, V) else weigher_mod.Items(K, V);
+    return Cache(K, V, .sampled_lru, Weigher);
 }
 
-pub fn SampledLruCacheWithWeigher(comptime V: type, comptime Weigher: type) type {
-    return Cache(V, .sampled_lru, Weigher);
+pub fn SampledLruCacheWithWeigher(comptime K: type, comptime V: type, comptime Weigher: type) type {
+    return Cache(K, V, .sampled_lru, Weigher);
 }
 
-pub fn SampledLhdCache(comptime V: type, comptime Weigher: type) type {
-    return Cache(V, .sampled_lhd, Weigher);
+pub fn SampledLhdCache(comptime K: type, comptime V: type, comptime Weigher: type) type {
+    return Cache(K, V, .sampled_lhd, Weigher);
 }
 
-pub fn StableLruCache(comptime V: type) type {
-    return Cache(V, .stable_lru, weigher_mod.Bytes(V));
+pub fn StableLruCache(comptime K: type, comptime V: type) type {
+    const Weigher = if (comptime isByteSlice(K)) weigher_mod.Bytes(K, V) else weigher_mod.Items(K, V);
+    return Cache(K, V, .stable_lru, Weigher);
 }
 
-pub fn StableLruCacheWithWeigher(comptime V: type, comptime Weigher: type) type {
-    return Cache(V, .stable_lru, Weigher);
+pub fn StableLruCacheWithWeigher(comptime K: type, comptime V: type, comptime Weigher: type) type {
+    return Cache(K, V, .stable_lru, Weigher);
 }
 
-pub fn StableLhdCache(comptime V: type, comptime Weigher: type) type {
-    return Cache(V, .stable_lhd, Weigher);
+pub fn StableLhdCache(comptime K: type, comptime V: type, comptime Weigher: type) type {
+    return Cache(K, V, .stable_lhd, Weigher);
 }

@@ -5,9 +5,16 @@ const MultiThreadedConfig = @import("../config.zig").Config;
 const weigher_mod = @import("../weigher.zig");
 
 const FrequencySketch = @import("../frequency_sketch.zig").FrequencySketch;
+const key_context = @import("../key_context.zig");
+const key_ops = @import("../key_ops.zig");
 
 const ItemMod = @import("item.zig");
 const StoreMod = @import("store.zig");
+
+fn isByteSlice(comptime K: type) bool {
+    const info = @typeInfo(K);
+    return info == .pointer and info.pointer.size == .slice and info.pointer.child == u8;
+}
 
 pub const Config = struct {
     max_weight: usize = 10_000,
@@ -52,18 +59,23 @@ pub const Config = struct {
 ///
 /// All mutating operations require an explicit `allocator`.
 pub fn CacheUnmanaged(
+    comptime K: type,
     comptime V: type,
     comptime policy: Policy,
     comptime Weigher: type,
 ) type {
     const stable_lru = policy == .stable_lru;
-    const Item = ItemMod.Item(V, stable_lru);
-    const Store = StoreMod.Store(Item);
+    const Context = key_context.AutoContext(K);
+    const KeyOps = key_ops.Auto(K);
+
+    const Item = ItemMod.Item(K, V, stable_lru, KeyOps);
+    const Store = StoreMod.Store(K, Item, Context);
 
     return struct {
         config: Config,
         weigher: Weigher,
-        store: Store = .{},
+        ctx: Context = .{},
+        store: Store = Store.init(.{}),
 
         access_clock: u64 = 0,
         total_weight: usize = 0,
@@ -75,12 +87,15 @@ pub fn CacheUnmanaged(
         protected_list: if (stable_lru) std.DoublyLinkedList else void = if (stable_lru) .{} else {},
         protected_weight: if (stable_lru) usize else void = if (stable_lru) 0 else {},
 
+        pub const Key = K;
+        pub const KeyContext = Context;
+
         /// Initializes the cache with an explicit `weigher`.
         pub fn init(allocator: std.mem.Allocator, config_in: Config, weigher: Weigher) !@This() {
-            comptime validateWeigher(V, Weigher);
+            comptime validateWeigher(K, V, Weigher);
             const cfg = config_in.build();
 
-            var out: @This() = .{ .config = cfg, .weigher = weigher };
+            var out: @This() = .{ .config = cfg, .weigher = weigher, .ctx = .{}, .store = Store.init(.{}) };
             if (cfg.enable_tiny_lfu) {
                 try out.frequency_sketch.ensureCapacity(allocator, cfg.max_weight, cfg.tiny_lfu_sample_scale);
             }
@@ -125,9 +140,9 @@ pub fn CacheUnmanaged(
         }
 
         /// Returns an `ItemRef` for `key` and records a hit.
-        pub fn get(self: *@This(), allocator: std.mem.Allocator, key: []const u8) ?ItemRef {
+        pub fn get(self: *@This(), allocator: std.mem.Allocator, key: K) ?ItemRef {
             if (self.config.enable_tiny_lfu) {
-                self.frequency_sketch.increment(hashKey(key));
+                self.frequency_sketch.increment(self.ctx.hash(key));
             }
 
             const item = self.store.get(key) orelse return null;
@@ -151,9 +166,9 @@ pub fn CacheUnmanaged(
         /// Fast-path borrowed pointer.
         ///
         /// Valid only until the next mutating operation (`set`/`replace`/`delete`/`clear`).
-        pub fn getBorrowed(self: *@This(), key: []const u8) ?*const V {
+        pub fn getBorrowed(self: *@This(), key: K) ?*const V {
             if (self.config.enable_tiny_lfu) {
-                self.frequency_sketch.increment(hashKey(key));
+                self.frequency_sketch.increment(self.ctx.hash(key));
             }
 
             const item = self.store.get(key) orelse return null;
@@ -171,7 +186,7 @@ pub fn CacheUnmanaged(
         }
 
         /// Returns an `ItemRef` for `key` without recording a hit.
-        pub fn peek(self: *@This(), allocator: std.mem.Allocator, key: []const u8) ?ItemRef {
+        pub fn peek(self: *@This(), allocator: std.mem.Allocator, key: K) ?ItemRef {
             const item = self.store.get(key) orelse return null;
             item.retain();
 
@@ -184,8 +199,8 @@ pub fn CacheUnmanaged(
         }
 
         /// Inserts `key` → `value` with TTL and returns an `ItemRef`.
-        pub fn set(self: *@This(), allocator: std.mem.Allocator, key: []const u8, value: V, ttl_ns: u64) !ItemRef {
-            const candidate_hash = hashKey(key);
+        pub fn set(self: *@This(), allocator: std.mem.Allocator, key: K, value: V, ttl_ns: u64) !ItemRef {
+            const candidate_hash = self.ctx.hash(key);
 
             const weight = self.weigher.weigh(key, &value);
             const item = try Item.create(allocator, key, value, ttl_ns, weight);
@@ -231,7 +246,7 @@ pub fn CacheUnmanaged(
         }
 
         /// Replaces an existing key’s value (preserving TTL).
-        pub fn replace(self: *@This(), allocator: std.mem.Allocator, key: []const u8, value: V) !?ItemRef {
+        pub fn replace(self: *@This(), allocator: std.mem.Allocator, key: K, value: V) !?ItemRef {
             const existing = self.peek(allocator, key) orelse return null;
             defer existing.deinit();
             const ttl = existing.ttlNs();
@@ -239,7 +254,7 @@ pub fn CacheUnmanaged(
         }
 
         /// Deletes an item and returns its `ItemRef`.
-        pub fn delete(self: *@This(), allocator: std.mem.Allocator, key: []const u8) ?ItemRef {
+        pub fn delete(self: *@This(), allocator: std.mem.Allocator, key: K) ?ItemRef {
             const item = self.store.delete(key) orelse return null;
 
             if (comptime stable_lru) {
@@ -273,7 +288,7 @@ pub fn CacheUnmanaged(
             }
 
             self.store.deinit(allocator);
-            self.store = .{};
+            self.store = Store.init(self.ctx);
 
             self.access_clock = 0;
             self.total_weight = 0;
@@ -287,7 +302,7 @@ pub fn CacheUnmanaged(
         }
 
         /// Extends an item's TTL by `ttl_ns`.
-        pub fn extend(self: *@This(), allocator: std.mem.Allocator, key: []const u8, ttl_ns: u64) bool {
+        pub fn extend(self: *@This(), allocator: std.mem.Allocator, key: K, ttl_ns: u64) bool {
             const ref = self.peek(allocator, key) orelse return false;
             defer ref.deinit();
 
@@ -333,8 +348,15 @@ pub fn CacheUnmanaged(
                 self.item.release(self.allocator);
             }
 
-            /// Returns the owned cache key.
-            pub fn key(self: ItemRef) []const u8 {
+            /// Returns the cache key.
+            ///
+            /// Keys are logically immutable once inserted.
+            /// - For value keys, this returns a copy.
+            /// - For slice keys, this returns a read-only view into cache-owned
+            ///   memory that remains valid while this `ItemRef` is alive.
+            ///
+            /// Do not mutate the returned key (e.g. via `@constCast`).
+            pub fn key(self: ItemRef) K {
                 return self.item.key;
             }
 
@@ -361,7 +383,7 @@ pub fn CacheUnmanaged(
 
         fn validateFilterPredicate(comptime V_check: type, comptime PredContext: type) void {
             if (!@hasDecl(PredContext, "pred")) {
-                @compileError("filter() predicate must declare pub fn pred(self: PredContext, key: []const u8, value: *const V) bool");
+                @compileError("filter() predicate must declare pub fn pred(self: PredContext, key: K, value: *const V) bool");
             }
 
             const fn_info = switch (@typeInfo(@TypeOf(PredContext.pred))) {
@@ -380,8 +402,8 @@ pub fn CacheUnmanaged(
             }
 
             const p1 = params[1].type orelse @compileError("filter() predicate missing key type");
-            if (p1 != []const u8) {
-                @compileError("filter() predicate key parameter must be []const u8");
+            if (p1 != K) {
+                @compileError("filter() predicate key parameter must be K");
             }
 
             const p2 = params[2].type orelse @compileError("filter() predicate missing value type");
@@ -408,12 +430,6 @@ pub fn CacheUnmanaged(
             x *%= 0x2545F4914F6CDD1D;
             self.rng_state = x;
             return x;
-        }
-
-        fn hashKey(key: []const u8) u64 {
-            var h = std.hash.Fnv1a_64.init();
-            h.update(key);
-            return h.final();
         }
 
         fn applyTinyLfuAdmission(self: *@This(), allocator: std.mem.Allocator, candidate: *Item, candidate_hash: u64) bool {
@@ -443,7 +459,7 @@ pub fn CacheUnmanaged(
                 if (containsItem(victims.items, victim)) continue;
 
                 const weight = @max(victim.weight, 1);
-                const hash = hashKey(victim.key);
+                const hash = self.ctx.hash(victim.key);
 
                 victims.appendBounded(victim) catch break;
                 victims_weight += weight;
@@ -716,9 +732,9 @@ pub fn CacheUnmanaged(
             }
         }
 
-        fn validateWeigher(comptime V_check: type, comptime Weigher_check: type) void {
+        fn validateWeigher(comptime K_check: type, comptime V_check: type, comptime Weigher_check: type) void {
             if (!@hasDecl(Weigher_check, "weigh")) {
-                @compileError("Weigher must declare pub fn weigh(self: Weigher, key: []const u8, value: *const V) usize");
+                @compileError("Weigher must declare pub fn weigh(self: Weigher, key: K, value: *const V) usize");
             }
 
             const fn_info = switch (@typeInfo(@TypeOf(Weigher_check.weigh))) {
@@ -737,8 +753,8 @@ pub fn CacheUnmanaged(
             }
 
             const p1 = params[1].type orelse @compileError("Weigher.weigh missing key type");
-            if (p1 != []const u8) {
-                @compileError("Weigher.weigh key parameter must be []const u8");
+            if (p1 != K_check) {
+                @compileError("Weigher.weigh key parameter must be K");
             }
 
             const p2 = params[2].type orelse @compileError("Weigher.weigh missing value type");
@@ -772,8 +788,8 @@ pub fn CacheUnmanaged(
 /// var get_ref = cache.get("k") orelse return error.Miss;
 /// defer get_ref.deinit();
 /// ```
-pub fn Cache(comptime V: type, comptime policy: Policy, comptime Weigher: type) type {
-    const Unmanaged = CacheUnmanaged(V, policy, Weigher);
+pub fn Cache(comptime K: type, comptime V: type, comptime policy: Policy, comptime Weigher: type) type {
+    const Unmanaged = CacheUnmanaged(K, V, policy, Weigher);
 
     return struct {
         unmanaged: Unmanaged,
@@ -798,34 +814,34 @@ pub fn Cache(comptime V: type, comptime policy: Policy, comptime Weigher: type) 
         }
 
         /// Returns an `ItemRef` for `key` and records a cache hit.
-        pub fn get(self: *@This(), key: []const u8) ?Unmanaged.ItemRef {
+        pub fn get(self: *@This(), key: K) ?Unmanaged.ItemRef {
             return self.unmanaged.get(self.allocator, key);
         }
 
         /// Fast-path borrowed pointer.
         ///
         /// Valid only until the next mutating operation (`set`/`replace`/`delete`/`clear`).
-        pub fn getBorrowed(self: *@This(), key: []const u8) ?*const V {
+        pub fn getBorrowed(self: *@This(), key: K) ?*const V {
             return self.unmanaged.getBorrowed(key);
         }
 
         /// Returns an `ItemRef` for `key` without recording a hit.
-        pub fn peek(self: *@This(), key: []const u8) ?Unmanaged.ItemRef {
+        pub fn peek(self: *@This(), key: K) ?Unmanaged.ItemRef {
             return self.unmanaged.peek(self.allocator, key);
         }
 
         /// Inserts `key` → `value` with TTL and returns an `ItemRef`.
-        pub fn set(self: *@This(), key: []const u8, value: V, ttl_ns: u64) !Unmanaged.ItemRef {
+        pub fn set(self: *@This(), key: K, value: V, ttl_ns: u64) !Unmanaged.ItemRef {
             return self.unmanaged.set(self.allocator, key, value, ttl_ns);
         }
 
         /// Replaces the value for an existing key (preserving TTL).
-        pub fn replace(self: *@This(), key: []const u8, value: V) !?Unmanaged.ItemRef {
+        pub fn replace(self: *@This(), key: K, value: V) !?Unmanaged.ItemRef {
             return self.unmanaged.replace(self.allocator, key, value);
         }
 
         /// Deletes an item and returns its `ItemRef`.
-        pub fn delete(self: *@This(), key: []const u8) ?Unmanaged.ItemRef {
+        pub fn delete(self: *@This(), key: K) ?Unmanaged.ItemRef {
             return self.unmanaged.delete(self.allocator, key);
         }
 
@@ -850,7 +866,7 @@ pub fn Cache(comptime V: type, comptime policy: Policy, comptime Weigher: type) 
         }
 
         /// Extends an item's TTL by `ttl_ns`.
-        pub fn extend(self: *@This(), key: []const u8, ttl_ns: u64) bool {
+        pub fn extend(self: *@This(), key: K, ttl_ns: u64) bool {
             return self.unmanaged.extend(self.allocator, key, ttl_ns);
         }
 
@@ -866,26 +882,28 @@ pub fn Cache(comptime V: type, comptime policy: Policy, comptime Weigher: type) 
     };
 }
 
-pub fn SampledLruCache(comptime V: type) type {
-    return Cache(V, .sampled_lru, weigher_mod.Bytes(V));
+pub fn SampledLruCache(comptime K: type, comptime V: type) type {
+    const Weigher = if (comptime isByteSlice(K)) weigher_mod.Bytes(K, V) else weigher_mod.Items(K, V);
+    return Cache(K, V, .sampled_lru, Weigher);
 }
 
-pub fn SampledLruCacheWithWeigher(comptime V: type, comptime Weigher: type) type {
-    return Cache(V, .sampled_lru, Weigher);
+pub fn SampledLruCacheWithWeigher(comptime K: type, comptime V: type, comptime Weigher: type) type {
+    return Cache(K, V, .sampled_lru, Weigher);
 }
 
-pub fn SampledLhdCache(comptime V: type, comptime Weigher: type) type {
-    return Cache(V, .sampled_lhd, Weigher);
+pub fn SampledLhdCache(comptime K: type, comptime V: type, comptime Weigher: type) type {
+    return Cache(K, V, .sampled_lhd, Weigher);
 }
 
-pub fn StableLruCache(comptime V: type) type {
-    return Cache(V, .stable_lru, weigher_mod.Bytes(V));
+pub fn StableLruCache(comptime K: type, comptime V: type) type {
+    const Weigher = if (comptime isByteSlice(K)) weigher_mod.Bytes(K, V) else weigher_mod.Items(K, V);
+    return Cache(K, V, .stable_lru, Weigher);
 }
 
-pub fn StableLruCacheWithWeigher(comptime V: type, comptime Weigher: type) type {
-    return Cache(V, .stable_lru, Weigher);
+pub fn StableLruCacheWithWeigher(comptime K: type, comptime V: type, comptime Weigher: type) type {
+    return Cache(K, V, .stable_lru, Weigher);
 }
 
-pub fn StableLhdCache(comptime V: type, comptime Weigher: type) type {
-    return Cache(V, .stable_lhd, Weigher);
+pub fn StableLhdCache(comptime K: type, comptime V: type, comptime Weigher: type) type {
+    return Cache(K, V, .stable_lhd, Weigher);
 }

@@ -4,11 +4,11 @@ const std = @import("std");
 ///
 /// This is an internal object allocated on the heap. `Cache(V).ItemRef` is the
 /// public reference-counted handle to an item.
-pub fn Item(comptime V: type) type {
+pub fn Item(comptime K: type, comptime V: type, comptime KeyOps: type) type {
     return struct {
         const Self = @This();
 
-        key: []u8,
+        key: K,
         value: V,
         weight: usize,
 
@@ -20,8 +20,10 @@ pub fn Item(comptime V: type) type {
         ref_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
 
         /// Allocate a new item.
-        pub fn create(allocator: std.mem.Allocator, key: []const u8, value: V, ttl_ns: u64, weight: usize) !*Self {
-            const owned_key = try allocator.dupe(u8, key);
+        pub fn create(allocator: std.mem.Allocator, key: K, value: V, ttl_ns: u64, weight: usize) !*Self {
+            var owned_key = try KeyOps.clone(allocator, key);
+            errdefer KeyOps.deinit(allocator, &owned_key);
+
             const item = try allocator.create(Self);
             item.* = .{
                 .key = owned_key,
@@ -38,11 +40,11 @@ pub fn Item(comptime V: type) type {
         }
 
         /// Reset an existing item in-place (used by reuse pools if added later).
-        pub fn reset(self: *Self, allocator: std.mem.Allocator, key: []const u8, value: V, ttl_ns: u64, weight: usize) !void {
-            allocator.free(self.key);
+        pub fn reset(self: *Self, allocator: std.mem.Allocator, key: K, value: V, ttl_ns: u64, weight: usize) !void {
+            KeyOps.deinit(allocator, &self.key);
             maybeDeinitValue(allocator, &self.value);
 
-            self.key = try allocator.dupe(u8, key);
+            self.key = try KeyOps.clone(allocator, key);
             self.value = value;
             self.weight = weight;
 
@@ -62,7 +64,7 @@ pub fn Item(comptime V: type) type {
         pub fn release(self: *Self, allocator: std.mem.Allocator) void {
             const prev = self.ref_count.fetchSub(1, .acq_rel);
             if (prev == 1) {
-                allocator.free(self.key);
+                KeyOps.deinit(allocator, &self.key);
                 maybeDeinitValue(allocator, &self.value);
                 allocator.destroy(self);
             }
