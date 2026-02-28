@@ -29,10 +29,23 @@ pub fn Store(comptime K: type, comptime ItemT: type, comptime Context: type) typ
         }
 
         pub fn put(self: *@This(), allocator: std.mem.Allocator, item: *ItemT) !?*ItemT {
-            const old_kv = self.map.fetchRemoveContext(item.key, self.ctx);
-            if (old_kv) |kv| {
-                self.swapRemoveItem(kv.value);
+            if (self.map.getContext(item.key, self.ctx)) |_| {
+                // Existing key: update in-place so the operation stays transactional.
+                const gop = try self.map.getOrPutContext(allocator, item.key, self.ctx);
+                std.debug.assert(gop.found_existing);
+
+                const old_item = gop.value_ptr.*;
+                const idx = old_item.items_index;
+
+                gop.key_ptr.* = item.key;
+                gop.value_ptr.* = item;
+                self.items.items[idx] = item;
+                item.items_index = idx;
+                return old_item;
             }
+
+            try self.map.ensureUnusedCapacity(allocator, 1);
+            try self.items.ensureUnusedCapacity(allocator, 1);
 
             const gop = try self.map.getOrPutContext(allocator, item.key, self.ctx);
             std.debug.assert(!gop.found_existing);
@@ -40,9 +53,7 @@ pub fn Store(comptime K: type, comptime ItemT: type, comptime Context: type) typ
             gop.value_ptr.* = item;
 
             item.items_index = self.items.items.len;
-            try self.items.append(allocator, item);
-
-            if (old_kv) |kv| return kv.value;
+            self.items.appendAssumeCapacity(item);
             return null;
         }
 

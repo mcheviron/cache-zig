@@ -93,9 +93,18 @@ pub fn Item(comptime K: type, comptime V: type, comptime KeyOps: type) type {
             return @intCast(@as(i64, expires - now));
         }
 
-        /// Set expiration to now+ttl_ns.
+        /// Extend expiration by `ttl_ns` from max(current_expiry, now).
         pub fn extend(self: *Self, ttl_ns: u64) void {
-            self.expires_at_ns.store(addTtl(nowNs(), ttl_ns), .release);
+            const now = nowNs();
+            while (true) {
+                const current = self.expires_at_ns.load(.acquire);
+                const base = if (current > now) current else now;
+                const next = addTtl(base, ttl_ns);
+
+                if (self.expires_at_ns.cmpxchgWeak(current, next, .acq_rel, .acquire) == null) {
+                    return;
+                }
+            }
         }
 
         /// Set the creation tick (used for hit-density eviction).

@@ -129,6 +129,23 @@ test "replace preserves ttl" {
     try std.testing.expectEqual(@as(u8, 2), after.value().*);
 }
 
+test "extend adds to existing ttl" {
+    const alloc = std.testing.allocator;
+    var cache = try SampledLruCache(Key, u8).init(alloc, Config{ .max_weight = 10_000 });
+    defer cache.deinit();
+
+    {
+        var item = try cache.set("a", 1, 2 * std.time.ns_per_s);
+        defer item.deinit();
+    }
+
+    try std.testing.expect(cache.extend("a", 1 * std.time.ns_per_s));
+
+    var got = (cache.get("a") orelse return error.Miss);
+    defer got.deinit();
+    try std.testing.expect(got.ttlNs() > (2 * std.time.ns_per_s + 400 * std.time.ns_per_ms));
+}
+
 test "snapshot and filter" {
     const alloc = std.testing.allocator;
     var cache = try SampledLruCache(Key, u8).init(alloc, Config{ .max_weight = 10_000 });
@@ -390,6 +407,8 @@ test "evicts stable LHD when over weight" {
     {
         var k3 = try cache.set("k3", 3, 60 * std.time.ns_per_s);
         defer k3.deinit();
+        try std.testing.expectEqual(.inserted, k3.status);
+        try std.testing.expect(k3.item != null);
     }
 
     try std.testing.expect(cache.peek("k2") == null);
@@ -424,6 +443,8 @@ test "TinyLFU rejects cold insert (sampled LRU)" {
     {
         var k3 = try cache.set("k3", 3, 60 * std.time.ns_per_s);
         defer k3.deinit();
+        try std.testing.expectEqual(.rejected, k3.status);
+        try std.testing.expect(k3.item == null);
     }
 
     try std.testing.expect(cache.peek("k3") == null);
@@ -538,6 +559,8 @@ test "TinyLFU stable LRU reject keeps LRU order" {
     {
         var k4 = try cache.set("k4", 4, 60 * std.time.ns_per_s);
         defer k4.deinit();
+        try std.testing.expectEqual(.inserted, k4.status);
+        try std.testing.expect(k4.item != null);
     }
 
     {
@@ -549,4 +572,80 @@ test "TinyLFU stable LRU reject keeps LRU order" {
         var k2 = cache.peek("k2") orelse return error.Miss;
         defer k2.deinit();
     }
+}
+
+test "clear resets TinyLFU sketch" {
+    const alloc = std.testing.allocator;
+
+    const cfg = Config{
+        .shard_count = 1,
+        .max_weight = 20,
+        .items_to_prune = 10,
+        .sample_size = 8,
+    };
+
+    var cache = try SampledLruCacheWithWeigher(Key, u64, Weigher10).init(alloc, cfg);
+    defer cache.deinit();
+
+    {
+        var a = try cache.set("a", 1, 60 * std.time.ns_per_s);
+        defer a.deinit();
+        var b = try cache.set("b", 2, 60 * std.time.ns_per_s);
+        defer b.deinit();
+    }
+
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        _ = cache.get("z");
+    }
+
+    cache.clear();
+
+    {
+        var x = try cache.set("x", 10, 60 * std.time.ns_per_s);
+        defer x.deinit();
+        var y = try cache.set("y", 20, 60 * std.time.ns_per_s);
+        defer y.deinit();
+    }
+
+    {
+        var z = try cache.set("z", 30, 60 * std.time.ns_per_s);
+        defer z.deinit();
+    }
+
+    try std.testing.expect(cache.peek("z") == null);
+}
+
+test "snapshot OOM releases retained refs" {
+    const alloc = std.testing.allocator;
+    var cache = try SampledLruCache(Key, u8).init(alloc, Config{ .shard_count = 1, .max_weight = 10_000, .enable_tiny_lfu = false });
+    defer cache.deinit();
+
+    {
+        var a = try cache.set("a", 1, 60 * std.time.ns_per_s);
+        defer a.deinit();
+    }
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 1 });
+    try std.testing.expectError(error.OutOfMemory, cache.snapshot(failing.allocator()));
+}
+
+test "filter OOM releases retained refs" {
+    const alloc = std.testing.allocator;
+    var cache = try SampledLruCache(Key, u8).init(alloc, Config{ .shard_count = 1, .max_weight = 10_000, .enable_tiny_lfu = false });
+    defer cache.deinit();
+
+    {
+        var a = try cache.set("a", 1, 60 * std.time.ns_per_s);
+        defer a.deinit();
+    }
+
+    const PredCtx = struct {
+        pub fn pred(_: @This(), _: []const u8, _: *const u8) bool {
+            return true;
+        }
+    };
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 1 });
+    try std.testing.expectError(error.OutOfMemory, cache.filter(failing.allocator(), PredCtx, .{}));
 }

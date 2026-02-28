@@ -179,7 +179,7 @@ pub fn CacheUnmanaged(
                 }
             }
 
-            return .{ .item = item, .allocator = allocator };
+            return .{ .item = item };
         }
 
         /// Fast-path borrowed pointer.
@@ -214,11 +214,11 @@ pub fn CacheUnmanaged(
                 return null;
             }
 
-            return .{ .item = item, .allocator = allocator };
+            return .{ .item = item };
         }
 
-        /// Inserts `key` → `value` with TTL and returns an `ItemRef`.
-        pub fn set(self: *@This(), allocator: std.mem.Allocator, key: K, value: V, ttl_ns: u64) !ItemRef {
+        /// Inserts `key` → `value` with TTL and returns insertion status.
+        pub fn set(self: *@This(), allocator: std.mem.Allocator, key: K, value: V, ttl_ns: u64) !SetResult {
             const candidate_hash = self.ctx.hash(key);
 
             const weight = self.weigher.weigh(key, &value);
@@ -249,31 +249,43 @@ pub fn CacheUnmanaged(
 
             // Take a user-owned ref before eviction can drop the cache-owned ref.
             item.retain();
-            const ref: ItemRef = .{ .item = item, .allocator = allocator };
+            var admitted = true;
 
             if (comptime stable_lru) {
                 self.ensureWindowLimit(allocator);
                 self.evictStableLru(allocator);
+                admitted = self.store.get(item.key) == item;
             } else {
                 if (self.config.enable_tiny_lfu and !replaced) {
-                    _ = self.applyTinyLfuAdmission(allocator, item, candidate_hash);
+                    admitted = self.applyTinyLfuAdmission(allocator, item, candidate_hash);
                 }
                 self.evictIfNeeded(allocator);
+                if (admitted and self.store.get(item.key) != item) {
+                    admitted = false;
+                }
             }
 
-            return ref;
+            if (!admitted) {
+                item.release(allocator);
+                return .{ .status = .rejected, .item = null };
+            }
+
+            return .{
+                .status = if (replaced) .replaced else .inserted,
+                .item = .{ .item = item },
+            };
         }
 
         /// Replaces an existing key’s value (preserving TTL).
-        pub fn replace(self: *@This(), allocator: std.mem.Allocator, key: K, value: V) !?ItemRef {
+        pub fn replace(self: *@This(), allocator: std.mem.Allocator, key: K, value: V) !?SetResult {
             const existing = self.peek(allocator, key) orelse return null;
-            defer existing.deinit();
+            defer existing.deinit(allocator);
             const ttl = existing.ttlNs();
             return try self.set(allocator, key, value, ttl);
         }
 
         /// Deletes an item and returns its `ItemRef`.
-        pub fn delete(self: *@This(), allocator: std.mem.Allocator, key: K) ?ItemRef {
+        pub fn delete(self: *@This(), _: std.mem.Allocator, key: K) ?ItemRef {
             const item = self.store.delete(key) orelse return null;
 
             if (comptime stable_lru) {
@@ -283,7 +295,7 @@ pub fn CacheUnmanaged(
             item.markDead();
             self.total_weight -|= item.weight;
 
-            return .{ .item = item, .allocator = allocator };
+            return .{ .item = item };
         }
 
         /// Removes all items from the cache.
@@ -334,7 +346,7 @@ pub fn CacheUnmanaged(
         /// Extends an item's TTL by `ttl_ns`.
         pub fn extend(self: *@This(), allocator: std.mem.Allocator, key: K, ttl_ns: u64) bool {
             const ref = self.peek(allocator, key) orelse return false;
-            defer ref.deinit();
+            defer ref.deinit(allocator);
 
             ref.extend(ttl_ns);
             ref.item.touch(self.nextTick());
@@ -344,9 +356,19 @@ pub fn CacheUnmanaged(
         /// Returns a snapshot of current items.
         pub fn snapshot(self: *@This(), allocator: std.mem.Allocator) !std.ArrayList(ItemRef) {
             var list: std.ArrayList(ItemRef) = .empty;
+            errdefer {
+                for (list.items) |it| {
+                    it.deinit(allocator);
+                }
+                list.deinit(allocator);
+            }
+
             for (self.store.items.items) |item| {
                 item.retain();
-                try list.append(allocator, .{ .item = item, .allocator = allocator });
+                {
+                    errdefer item.release(allocator);
+                    try list.append(allocator, .{ .item = item });
+                }
             }
             return list;
         }
@@ -355,27 +377,70 @@ pub fn CacheUnmanaged(
         pub fn filter(self: *@This(), allocator: std.mem.Allocator, comptime PredContext: type, pred_ctx: PredContext) !std.ArrayList(ItemRef) {
             comptime validateFilterPredicate(V, PredContext);
             var list: std.ArrayList(ItemRef) = .empty;
+            errdefer {
+                for (list.items) |it| {
+                    it.deinit(allocator);
+                }
+                list.deinit(allocator);
+            }
 
             for (self.store.items.items) |item| {
                 if (PredContext.pred(pred_ctx, item.key, &item.value)) {
                     item.retain();
-                    try list.append(allocator, .{ .item = item, .allocator = allocator });
+                    {
+                        errdefer item.release(allocator);
+                        try list.append(allocator, .{ .item = item });
+                    }
                 }
             }
 
             return list;
         }
 
+        pub const SetStatus = enum {
+            inserted,
+            replaced,
+            rejected,
+        };
+
+        pub const SetResult = struct {
+            status: SetStatus,
+            item: ?ItemRef,
+
+            pub fn deinit(self: SetResult, allocator: std.mem.Allocator) void {
+                if (self.item) |item| item.deinit(allocator);
+            }
+
+            pub fn key(self: SetResult) K {
+                return (self.item orelse unreachable).key();
+            }
+
+            pub fn value(self: SetResult) *const V {
+                return (self.item orelse unreachable).value();
+            }
+
+            pub fn isExpired(self: SetResult) bool {
+                return (self.item orelse unreachable).isExpired();
+            }
+
+            pub fn ttlNs(self: SetResult) u64 {
+                return (self.item orelse unreachable).ttlNs();
+            }
+
+            pub fn extend(self: SetResult, ttl_ns: u64) void {
+                (self.item orelse unreachable).extend(ttl_ns);
+            }
+        };
+
         /// Ref-counted handle to a cache item.
         ///
-        /// Always `defer ref.deinit();` for values returned by cache operations.
+        /// Always `defer ref.deinit(allocator);` for values returned by cache operations.
         pub const ItemRef = struct {
             item: *Item,
-            allocator: std.mem.Allocator,
 
             /// Releases this reference.
-            pub fn deinit(self: ItemRef) void {
-                self.item.release(self.allocator);
+            pub fn deinit(self: ItemRef, allocator: std.mem.Allocator) void {
+                self.item.release(allocator);
             }
 
             /// Returns the cache key.
@@ -954,6 +1019,66 @@ pub fn Cache(comptime K: type, comptime V: type, comptime policy: Policy, compti
         unmanaged: Unmanaged,
         allocator: std.mem.Allocator,
 
+        pub const SetStatus = Unmanaged.SetStatus;
+
+        pub const ItemRef = struct {
+            inner: Unmanaged.ItemRef,
+            allocator: std.mem.Allocator,
+
+            pub fn deinit(self: ItemRef) void {
+                self.inner.deinit(self.allocator);
+            }
+
+            pub fn key(self: ItemRef) K {
+                return self.inner.key();
+            }
+
+            pub fn value(self: ItemRef) *const V {
+                return self.inner.value();
+            }
+
+            pub fn isExpired(self: ItemRef) bool {
+                return self.inner.isExpired();
+            }
+
+            pub fn ttlNs(self: ItemRef) u64 {
+                return self.inner.ttlNs();
+            }
+
+            pub fn extend(self: ItemRef, ttl_ns: u64) void {
+                self.inner.extend(ttl_ns);
+            }
+        };
+
+        pub const SetResult = struct {
+            status: SetStatus,
+            item: ?ItemRef,
+
+            pub fn deinit(self: SetResult) void {
+                if (self.item) |item| item.deinit();
+            }
+
+            pub fn key(self: SetResult) K {
+                return (self.item orelse unreachable).key();
+            }
+
+            pub fn value(self: SetResult) *const V {
+                return (self.item orelse unreachable).value();
+            }
+
+            pub fn isExpired(self: SetResult) bool {
+                return (self.item orelse unreachable).isExpired();
+            }
+
+            pub fn ttlNs(self: SetResult) u64 {
+                return (self.item orelse unreachable).ttlNs();
+            }
+
+            pub fn extend(self: SetResult, ttl_ns: u64) void {
+                (self.item orelse unreachable).extend(ttl_ns);
+            }
+        };
+
         /// Initializes the cache using the default `Weigher` (must be zero-sized).
         pub fn init(allocator: std.mem.Allocator, config_in: Config) !@This() {
             if (@sizeOf(Weigher) != 0) {
@@ -973,8 +1098,9 @@ pub fn Cache(comptime K: type, comptime V: type, comptime policy: Policy, compti
         }
 
         /// Returns an `ItemRef` for `key` and records a cache hit.
-        pub fn get(self: *@This(), key: K) ?Unmanaged.ItemRef {
-            return self.unmanaged.get(self.allocator, key);
+        pub fn get(self: *@This(), key: K) ?ItemRef {
+            const item = self.unmanaged.get(self.allocator, key) orelse return null;
+            return self.wrapItemRef(item);
         }
 
         /// Fast-path borrowed pointer.
@@ -985,23 +1111,26 @@ pub fn Cache(comptime K: type, comptime V: type, comptime policy: Policy, compti
         }
 
         /// Returns an `ItemRef` for `key` without recording a hit.
-        pub fn peek(self: *@This(), key: K) ?Unmanaged.ItemRef {
-            return self.unmanaged.peek(self.allocator, key);
+        pub fn peek(self: *@This(), key: K) ?ItemRef {
+            const item = self.unmanaged.peek(self.allocator, key) orelse return null;
+            return self.wrapItemRef(item);
         }
 
-        /// Inserts `key` → `value` with TTL and returns an `ItemRef`.
-        pub fn set(self: *@This(), key: K, value: V, ttl_ns: u64) !Unmanaged.ItemRef {
-            return self.unmanaged.set(self.allocator, key, value, ttl_ns);
+        /// Inserts `key` → `value` with TTL and returns insertion status.
+        pub fn set(self: *@This(), key: K, value: V, ttl_ns: u64) !SetResult {
+            return self.wrapSetResult(try self.unmanaged.set(self.allocator, key, value, ttl_ns));
         }
 
         /// Replaces the value for an existing key (preserving TTL).
-        pub fn replace(self: *@This(), key: K, value: V) !?Unmanaged.ItemRef {
-            return self.unmanaged.replace(self.allocator, key, value);
+        pub fn replace(self: *@This(), key: K, value: V) !?SetResult {
+            const result = (try self.unmanaged.replace(self.allocator, key, value)) orelse return null;
+            return self.wrapSetResult(result);
         }
 
         /// Deletes an item and returns its `ItemRef`.
-        pub fn delete(self: *@This(), key: K) ?Unmanaged.ItemRef {
-            return self.unmanaged.delete(self.allocator, key);
+        pub fn delete(self: *@This(), key: K) ?ItemRef {
+            const item = self.unmanaged.delete(self.allocator, key) orelse return null;
+            return self.wrapItemRef(item);
         }
 
         /// Removes all items from the cache.
@@ -1030,13 +1159,58 @@ pub fn Cache(comptime K: type, comptime V: type, comptime policy: Policy, compti
         }
 
         /// Returns a snapshot of current items.
-        pub fn snapshot(self: *@This(), allocator: std.mem.Allocator) !std.ArrayList(Unmanaged.ItemRef) {
-            return self.unmanaged.snapshot(allocator);
+        pub fn snapshot(self: *@This(), allocator: std.mem.Allocator) !std.ArrayList(ItemRef) {
+            var raw = try self.unmanaged.snapshot(allocator);
+            errdefer {
+                for (raw.items) |item| item.deinit(self.allocator);
+                raw.deinit(allocator);
+            }
+
+            var list: std.ArrayList(ItemRef) = .empty;
+            errdefer {
+                for (list.items) |item| item.deinit();
+                list.deinit(allocator);
+            }
+
+            try list.ensureTotalCapacity(allocator, raw.items.len);
+            for (raw.items) |item| {
+                list.appendAssumeCapacity(self.wrapItemRef(item));
+            }
+            raw.deinit(allocator);
+            return list;
         }
 
         /// Returns items matching `PredContext.pred(pred_ctx, key, value)`.
-        pub fn filter(self: *@This(), allocator: std.mem.Allocator, comptime PredContext: type, pred_ctx: PredContext) !std.ArrayList(Unmanaged.ItemRef) {
-            return self.unmanaged.filter(allocator, PredContext, pred_ctx);
+        pub fn filter(self: *@This(), allocator: std.mem.Allocator, comptime PredContext: type, pred_ctx: PredContext) !std.ArrayList(ItemRef) {
+            var raw = try self.unmanaged.filter(allocator, PredContext, pred_ctx);
+            errdefer {
+                for (raw.items) |item| item.deinit(self.allocator);
+                raw.deinit(allocator);
+            }
+
+            var list: std.ArrayList(ItemRef) = .empty;
+            errdefer {
+                for (list.items) |item| item.deinit();
+                list.deinit(allocator);
+            }
+
+            try list.ensureTotalCapacity(allocator, raw.items.len);
+            for (raw.items) |item| {
+                list.appendAssumeCapacity(self.wrapItemRef(item));
+            }
+            raw.deinit(allocator);
+            return list;
+        }
+
+        fn wrapItemRef(self: *@This(), item: Unmanaged.ItemRef) ItemRef {
+            return .{ .inner = item, .allocator = self.allocator };
+        }
+
+        fn wrapSetResult(self: *@This(), result: Unmanaged.SetResult) SetResult {
+            return .{
+                .status = result.status,
+                .item = if (result.item) |item| self.wrapItemRef(item) else null,
+            };
         }
     };
 }

@@ -68,7 +68,9 @@ pub fn Item(comptime K: type, comptime V: type, comptime stable_lru: bool, compt
         }
 
         pub fn extend(self: *Self, ttl_ns: u64) void {
-            self.expires_at_ns = addTtl(nowNs(), ttl_ns);
+            const now = nowNs();
+            const base = if (self.expires_at_ns > now) self.expires_at_ns else now;
+            self.expires_at_ns = addTtl(base, ttl_ns);
         }
 
         pub fn setCreatedAtTick(self: *Self, tick: u64) void {

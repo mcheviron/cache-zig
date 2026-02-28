@@ -41,10 +41,17 @@ fn cloneValue(comptime T: type, allocator: Allocator, value: T) Allocator.Error!
 
         .array => |info| {
             var out: T = undefined;
-            errdefer deinitValue(T, allocator, &out);
+            var initialized: usize = 0;
+            errdefer {
+                var i: usize = 0;
+                while (i < initialized) : (i += 1) {
+                    deinitValue(info.child, allocator, &out[i]);
+                }
+            }
 
             for (value, 0..) |elem, i| {
                 out[i] = try cloneValue(info.child, allocator, elem);
+                initialized = i + 1;
             }
             return out;
         },
@@ -55,25 +62,39 @@ fn cloneValue(comptime T: type, allocator: Allocator, value: T) Allocator.Error!
             }
 
             var out = try allocator.alloc(info.child, value.len);
+            var initialized: usize = 0;
             errdefer {
-                for (out) |*elem| deinitValue(info.child, allocator, elem);
+                var i: usize = 0;
+                while (i < initialized) : (i += 1) {
+                    deinitValue(info.child, allocator, &out[i]);
+                }
                 allocator.free(out);
             }
 
             for (value, 0..) |elem, i| {
                 out[i] = try cloneValue(info.child, allocator, elem);
+                initialized = i + 1;
             }
 
             return out;
         },
 
         .@"struct" => |info| {
-            var out: T = value;
-            errdefer deinitValue(T, allocator, &out);
+            var out: T = undefined;
+            var cloned: [info.fields.len]bool = [_]bool{false} ** info.fields.len;
+            errdefer {
+                inline for (info.fields, 0..) |field, i| {
+                    if (field.is_comptime) continue;
+                    if (cloned[i]) {
+                        deinitValue(field.type, allocator, &@field(out, field.name));
+                    }
+                }
+            }
 
-            inline for (info.fields) |field| {
+            inline for (info.fields, 0..) |field, i| {
                 if (field.is_comptime) continue;
                 @field(out, field.name) = try cloneValue(field.type, allocator, @field(value, field.name));
+                cloned[i] = true;
             }
 
             return out;
@@ -156,4 +177,27 @@ fn deinitValue(comptime T: type, allocator: Allocator, value: *T) void {
 
         else => {},
     }
+}
+
+test "clone failure does not deinit caller-owned fields" {
+    const K = struct {
+        a: []u8,
+        b: []u8,
+    };
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const backing = gpa.allocator();
+
+    const a = try backing.dupe(u8, "one");
+    const b = try backing.dupe(u8, "two");
+    const key: K = .{ .a = a, .b = b };
+
+    var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = 1 });
+    const alloc = failing.allocator();
+
+    try std.testing.expectError(error.OutOfMemory, Auto(K).clone(alloc, key));
+
+    backing.free(key.a);
+    backing.free(key.b);
 }

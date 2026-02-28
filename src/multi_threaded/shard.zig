@@ -30,35 +30,69 @@ pub fn Shard(comptime K: type, comptime ItemPtr: type, comptime Context: type) t
         pub fn get(self: *@This(), key: K) ?ItemPtr {
             self.lock.lockShared();
             defer self.lock.unlockShared();
-            return self.map.getContext(key, self.ctx);
+
+            const item = self.map.getContext(key, self.ctx) orelse return null;
+            item.retain();
+            return item;
         }
 
-        pub fn set(self: *@This(), allocator: std.mem.Allocator, key: K, item: ItemPtr) !?ItemPtr {
+        pub fn set(
+            self: *@This(),
+            allocator: std.mem.Allocator,
+            key: K,
+            item: ItemPtr,
+            total_weight: *std.atomic.Value(usize),
+        ) !?ItemPtr {
             self.lock.lock();
             defer self.lock.unlock();
 
-            // IMPORTANT: the map stores keys by value.
-            // If `K` contains pointer/slice fields (e.g. `[]const u8`), a replace can
-            // change the backing allocation. On overwrite, remove+reinsert so the
-            // map's stored key stays tied to the new item's owned key.
-            if (self.map.fetchRemoveContext(key, self.ctx)) |removed| {
-                const old = removed.value;
-                const idx = (self.pos.fetchRemoveContext(key, self.ctx) orelse unreachable).value;
+            if (self.map.getContext(key, self.ctx)) |_| {
+                // Existing key: update in place so map/pos/items stay consistent even on OOM.
+                const map_gop = try self.map.getOrPutContext(allocator, key, self.ctx);
+                std.debug.assert(map_gop.found_existing);
+                const old = map_gop.value_ptr.*;
+                const idx = self.pos.getContext(key, self.ctx) orelse unreachable;
 
-                try self.map.putContext(allocator, item.key, item, self.ctx);
+                map_gop.key_ptr.* = item.key;
+                map_gop.value_ptr.* = item;
+
+                const pos_gop = try self.pos.getOrPutContext(allocator, key, self.ctx);
+                std.debug.assert(pos_gop.found_existing);
+                pos_gop.key_ptr.* = item.key;
+                pos_gop.value_ptr.* = idx;
+
                 self.items.items[idx] = item;
-                try self.pos.putContext(allocator, item.key, idx, self.ctx);
-
+                _ = total_weight.fetchSub(old.weight, .acq_rel);
+                _ = total_weight.fetchAdd(item.weight, .acq_rel);
                 return old;
             }
 
-            try self.map.putContext(allocator, item.key, item, self.ctx);
-            try self.pos.putContext(allocator, item.key, self.items.items.len, self.ctx);
-            try self.items.append(allocator, item);
+            try self.map.ensureUnusedCapacity(allocator, 1);
+            try self.pos.ensureUnusedCapacity(allocator, 1);
+            try self.items.ensureUnusedCapacity(allocator, 1);
+
+            const map_gop = try self.map.getOrPutContext(allocator, item.key, self.ctx);
+            std.debug.assert(!map_gop.found_existing);
+            map_gop.key_ptr.* = item.key;
+            map_gop.value_ptr.* = item;
+
+            const idx = self.items.items.len;
+            const pos_gop = try self.pos.getOrPutContext(allocator, item.key, self.ctx);
+            std.debug.assert(!pos_gop.found_existing);
+            pos_gop.key_ptr.* = item.key;
+            pos_gop.value_ptr.* = idx;
+
+            self.items.appendAssumeCapacity(item);
+            _ = total_weight.fetchAdd(item.weight, .acq_rel);
             return null;
         }
 
-        pub fn delete(self: *@This(), allocator: std.mem.Allocator, key: K) ?ItemPtr {
+        pub fn delete(
+            self: *@This(),
+            _: std.mem.Allocator,
+            key: K,
+            total_weight: *std.atomic.Value(usize),
+        ) ?ItemPtr {
             self.lock.lock();
             defer self.lock.unlock();
 
@@ -71,20 +105,21 @@ pub fn Shard(comptime K: type, comptime ItemPtr: type, comptime Context: type) t
             if (idx != last_idx) {
                 const swapped = self.items.items[last_idx];
                 self.items.items[idx] = swapped;
-                // Update swapped key index.
-                _ = self.pos.fetchRemoveContext(swapped.key, self.ctx);
-                self.pos.putContext(allocator, swapped.key, idx, self.ctx) catch unreachable;
+                const swapped_idx = self.pos.getPtrContext(swapped.key, self.ctx) orelse unreachable;
+                swapped_idx.* = idx;
             }
 
             self.items.items.len = last_idx;
+            _ = total_weight.fetchSub(old.weight, .acq_rel);
             return old;
         }
 
         pub fn deleteIfSame(
             self: *@This(),
-            allocator: std.mem.Allocator,
+            _: std.mem.Allocator,
             key: K,
             expected: ItemPtr,
+            total_weight: *std.atomic.Value(usize),
         ) ?ItemPtr {
             self.lock.lock();
             defer self.lock.unlock();
@@ -101,11 +136,12 @@ pub fn Shard(comptime K: type, comptime ItemPtr: type, comptime Context: type) t
             if (idx != last_idx) {
                 const swapped = self.items.items[last_idx];
                 self.items.items[idx] = swapped;
-                _ = self.pos.fetchRemoveContext(swapped.key, self.ctx);
-                self.pos.putContext(allocator, swapped.key, idx, self.ctx) catch unreachable;
+                const swapped_idx = self.pos.getPtrContext(swapped.key, self.ctx) orelse unreachable;
+                swapped_idx.* = idx;
             }
 
             self.items.items.len = last_idx;
+            _ = total_weight.fetchSub(old.weight, .acq_rel);
             return old;
         }
 
@@ -138,6 +174,8 @@ pub fn Shard(comptime K: type, comptime ItemPtr: type, comptime Context: type) t
             defer self.lock.unlockShared();
 
             for (self.items.items) |item| {
+                item.retain();
+                errdefer item.release(allocator);
                 try out.append(allocator, item);
             }
         }

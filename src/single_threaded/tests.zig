@@ -88,6 +88,24 @@ test "replace preserves ttl" {
     try std.testing.expectEqual(@as(u8, 2), after.value().*);
 }
 
+test "extend adds to existing ttl" {
+    const alloc = std.testing.allocator;
+    var cache = try SampledLruCache(Key, u8).init(alloc, Config{ .max_weight = 10_000 });
+    defer cache.deinit();
+
+    {
+        var item = try cache.set("a", 1, 2 * std.time.ns_per_s);
+        defer item.deinit();
+    }
+
+    try std.testing.expect(cache.extend("a", 1 * std.time.ns_per_s));
+
+    var got = cache.get("a") orelse return error.Miss;
+    defer got.deinit();
+
+    try std.testing.expect(got.ttlNs() > (2 * std.time.ns_per_s + 400 * std.time.ns_per_ms));
+}
+
 test "sampled LHD evicts low density" {
     const alloc = std.testing.allocator;
     var cache = try SampledLhdCache(Key, u64, Weigher10).init(alloc, Config{ .max_weight = 30, .sample_size = 8, .enable_tiny_lfu = false });
@@ -144,6 +162,8 @@ test "stable LRU compiles and basic ops" {
     {
         var c = try cache.set("c", 3, 60 * std.time.ns_per_s);
         defer c.deinit();
+        try std.testing.expectEqual(.inserted, c.status);
+        try std.testing.expect(c.item != null);
     }
 
     try std.testing.expect(cache.len() <= 2);
@@ -192,6 +212,8 @@ test "tiny lfu rejects cold candidate" {
     {
         var c = try cache.set("c", 3, 60 * std.time.ns_per_s);
         defer c.deinit();
+        try std.testing.expectEqual(.rejected, c.status);
+        try std.testing.expect(c.item == null);
     }
 
     if (cache.peek("a")) |it| {
@@ -332,4 +354,38 @@ test "tiny lfu admits frequent candidate" {
     } else {
         return error.Miss;
     }
+}
+
+test "snapshot OOM releases retained refs" {
+    const alloc = std.testing.allocator;
+    var cache = try SampledLruCache(Key, u8).init(alloc, Config{ .max_weight = 10_000 });
+    defer cache.deinit();
+
+    {
+        var a = try cache.set("a", 1, 60 * std.time.ns_per_s);
+        defer a.deinit();
+    }
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, cache.snapshot(failing.allocator()));
+}
+
+test "filter OOM releases retained refs" {
+    const alloc = std.testing.allocator;
+    var cache = try SampledLruCache(Key, u8).init(alloc, Config{ .max_weight = 10_000 });
+    defer cache.deinit();
+
+    {
+        var a = try cache.set("a", 1, 60 * std.time.ns_per_s);
+        defer a.deinit();
+    }
+
+    const PredCtx = struct {
+        pub fn pred(_: @This(), _: []const u8, _: *const u8) bool {
+            return true;
+        }
+    };
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, cache.filter(failing.allocator(), PredCtx, .{}));
 }
