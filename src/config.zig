@@ -33,6 +33,20 @@ pub const Config = struct {
     /// Scaling factor for the sketch sampling window.
     tiny_lfu_sample_scale: usize = 10,
 
+    /// Number of TinyLFU sketch stripes.
+    ///
+    /// `0` means auto-select based on shard count, capped at 64.
+    sketch_stripe_count: usize = 0,
+
+    /// Multiplier for eviction sample budget when cache length is small.
+    eviction_sampling_factor_small_cache: usize = 4,
+
+    /// Maximum number of victims considered in one admission/eviction batch.
+    eviction_batch_size: usize = 8,
+
+    /// Attempts multiplier for admission victim search.
+    admission_victim_attempt_factor: usize = 4,
+
     /// Stable-policy promotion batching.
     ///
     /// For stable policies, the maintenance worker only applies SLRU promotion
@@ -81,6 +95,10 @@ pub const Config = struct {
         out.items_to_prune = @max(out.items_to_prune, 1);
         out.sample_size = @max(out.sample_size, 1);
         out.tiny_lfu_sample_scale = @max(out.tiny_lfu_sample_scale, 1);
+        out.sketch_stripe_count = if (out.sketch_stripe_count > 64) 64 else out.sketch_stripe_count;
+        out.eviction_sampling_factor_small_cache = @max(out.eviction_sampling_factor_small_cache, 1);
+        out.eviction_batch_size = @max(@min(out.eviction_batch_size, 64), 1);
+        out.admission_victim_attempt_factor = @max(out.admission_victim_attempt_factor, 1);
         out.gets_per_promote = @max(out.gets_per_promote, 1);
         out.stable_lru_window_percent = if (out.stable_lru_window_percent > 100) 100 else out.stable_lru_window_percent;
         out.stable_lru_protected_percent = if (out.stable_lru_protected_percent > 100) 100 else out.stable_lru_protected_percent;

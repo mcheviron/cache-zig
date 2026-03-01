@@ -1,0 +1,67 @@
+{
+  "created_at_utc": "2026-03-01T00:53:00Z",
+  "host_scope": "single-machine-local-baseline",
+  "optimize_mode": "ReleaseFast",
+  "profiles": [
+    {
+      "name": "synthetic-matrix",
+      "repetitions": 1,
+      "ops_per_thread": 20000,
+      "warmup_ops_per_thread": 5000,
+      "threads": [
+        1,
+        4,
+        16
+      ],
+      "workloads": [
+        "get-heavy",
+        "mixed",
+        "set-heavy"
+      ],
+      "key_capacity_pairs": [
+        "1024/1024",
+        "8192/4096",
+        "65536/8192"
+      ],
+      "policies": [
+        "sampled_lru",
+        "sampled_lhd",
+        "stable_lru",
+        "stable_lhd"
+      ],
+      "csv": ".agent/benchmarks/baseline-20260301-synth.csv",
+      "json": ".agent/benchmarks/baseline-20260301-synth.json"
+    },
+    {
+      "name": "trace-loop",
+      "repetitions": 1,
+      "threads": [
+        1,
+        4,
+        16
+      ],
+      "traces": [
+        "loop"
+      ],
+      "capacities": [
+        256,
+        512,
+        768,
+        1024
+      ],
+      "policies": [
+        "sampled_lru",
+        "sampled_lhd",
+        "stable_lru",
+        "stable_lhd"
+      ],
+      "cache_trace_root": "/tmp/mokabench.ISRQNu/cache-trace",
+      "csv": ".agent/benchmarks/baseline-20260301-trace-loop.csv",
+      "json": ".agent/benchmarks/baseline-20260301-trace-loop.json"
+    }
+  ],
+  "notes": [
+    "This baseline freezes local harness outputs after implementing the Moka-or-better benchmarking framework.",
+    "Full trace matrix (loop,s3,ds1,oltp) and Moka comparison gate should be produced using scripts/bench/compare_with_moka.sh when full datasets are available."
+  ]
+}

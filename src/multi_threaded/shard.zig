@@ -46,18 +46,18 @@ pub fn Shard(comptime K: type, comptime ItemPtr: type, comptime Context: type) t
             self.lock.lock();
             defer self.lock.unlock();
 
-            if (self.map.getContext(key, self.ctx)) |_| {
+            const map_gop = try self.map.getOrPutContext(allocator, key, self.ctx);
+            if (map_gop.found_existing) {
                 // Existing key: update in place so map/pos/items stay consistent even on OOM.
-                const map_gop = try self.map.getOrPutContext(allocator, key, self.ctx);
-                std.debug.assert(map_gop.found_existing);
                 const old = map_gop.value_ptr.*;
-                const idx = self.pos.getContext(key, self.ctx) orelse unreachable;
+
+                const pos_gop = try self.pos.getOrPutContext(allocator, key, self.ctx);
+                std.debug.assert(pos_gop.found_existing);
+                const idx = pos_gop.value_ptr.*;
 
                 map_gop.key_ptr.* = item.key;
                 map_gop.value_ptr.* = item;
 
-                const pos_gop = try self.pos.getOrPutContext(allocator, key, self.ctx);
-                std.debug.assert(pos_gop.found_existing);
                 pos_gop.key_ptr.* = item.key;
                 pos_gop.value_ptr.* = idx;
 
@@ -67,14 +67,12 @@ pub fn Shard(comptime K: type, comptime ItemPtr: type, comptime Context: type) t
                 return old;
             }
 
-            try self.map.ensureUnusedCapacity(allocator, 1);
-            try self.pos.ensureUnusedCapacity(allocator, 1);
-            try self.items.ensureUnusedCapacity(allocator, 1);
-
-            const map_gop = try self.map.getOrPutContext(allocator, item.key, self.ctx);
-            std.debug.assert(!map_gop.found_existing);
             map_gop.key_ptr.* = item.key;
             map_gop.value_ptr.* = item;
+            errdefer _ = self.map.fetchRemoveContext(item.key, self.ctx);
+
+            try self.pos.ensureUnusedCapacity(allocator, 1);
+            try self.items.ensureUnusedCapacity(allocator, 1);
 
             const idx = self.items.items.len;
             const pos_gop = try self.pos.getOrPutContext(allocator, item.key, self.ctx);

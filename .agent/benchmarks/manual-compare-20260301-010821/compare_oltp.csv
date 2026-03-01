@@ -1,0 +1,13 @@
+trace,capacity,clients,cache_zig_ops_s,moka_best_ops_s,cache_zig_p95_ns,moka_avg_ns,cache_zig_hit_ratio_pct,moka_hit_ratio_pct,throughput_pass,p95_guard_pass,hit_parity_pass,variance_pass,overall_pass
+oltp,256,1,1142498.850,3109336.735,1000,321,18.0773,32.0330,false,false,false,true,false
+oltp,256,4,250379.925,3324163.636,40000,300,15.9459,30.4020,false,false,false,true,false
+oltp,256,16,103866.216,3373228.782,517000,296,15.9337,28.3530,false,false,false,true,false
+oltp,512,1,1208158.455,3288291.367,1000,304,26.3206,36.5760,false,false,false,true,false
+oltp,512,4,277402.014,3793132.780,39000,263,24.6621,35.0680,false,false,false,true,false
+oltp,512,16,122475.934,3731204.082,456000,268,24.4584,33.0590,false,false,false,true,false
+oltp,1000,1,1265605.045,3276505.376,2000,305,32.7805,35.7910,false,false,false,true,false
+oltp,1000,4,315683.821,4212649.770,38000,237,33.3067,39.0800,false,false,false,true,false
+oltp,1000,16,143650.293,3974543.478,414000,251,33.6577,37.3400,false,false,false,true,false
+oltp,2000,1,1295161.943,3475836.502,2000,287,39.0997,41.2210,false,false,false,true,false
+oltp,2000,4,358284.371,4941324.324,37000,202,40.7168,44.2140,false,false,false,true,false
+oltp,2000,16,165243.308,4687923.077,391000,213,41.3392,42.6560,false,false,false,true,false

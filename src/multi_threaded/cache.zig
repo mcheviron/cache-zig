@@ -456,6 +456,9 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
         }
 
         fn run(self: *Self) void {
+            const event_batch_cap: usize = 64;
+            var pending: [event_batch_cap]Event = undefined;
+
             while (true) {
                 self.lock.lock();
                 while (!self.stopping and self.len == 0) {
@@ -467,95 +470,111 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
                     return;
                 }
 
-                const ev = self.popUnsafe();
-                self.cond.signal();
+                const target_batch = @min(
+                    @max(self.cache.config.eviction_batch_size * 2, 1),
+                    event_batch_cap,
+                );
+                var batch_len: usize = 0;
+                while (self.len > 0 and batch_len < target_batch) : (batch_len += 1) {
+                    pending[batch_len] = self.popUnsafe();
+                }
+                if (self.len < self.buf.len) {
+                    self.cond.broadcast();
+                }
                 self.lock.unlock();
 
-                var run_evict = true;
-                switch (ev) {
-                    .promote => |it| {
-                        if (comptime stable_policy == .stable_lru) {
-                            if (self.isCurrentLiveItem(it)) {
-                                self.lru.recordHit(
-                                    self.allocator,
-                                    it,
-                                    self.cache.config.gets_per_promote,
-                                    self.cache.config.max_weight,
-                                    self.cache.config.stable_lru_window_percent,
-                                    self.cache.config.stable_lru_protected_percent,
-                                ) catch {
+                var batch_run_evict = false;
+                var i: usize = 0;
+                while (i < batch_len) : (i += 1) {
+                    const ev = pending[i];
+                    var run_evict = true;
+                    switch (ev) {
+                        .promote => |it| {
+                            if (comptime stable_policy == .stable_lru) {
+                                if (self.isCurrentLiveItem(it)) {
+                                    self.lru.recordHit(
+                                        self.allocator,
+                                        it,
+                                        self.cache.config.gets_per_promote,
+                                        self.cache.config.max_weight,
+                                        self.cache.config.stable_lru_window_percent,
+                                        self.cache.config.stable_lru_protected_percent,
+                                    ) catch {
+                                        it.release(self.allocator);
+                                    };
+                                } else {
                                     it.release(self.allocator);
-                                };
+                                }
                             } else {
                                 it.release(self.allocator);
                             }
-                        } else {
-                            it.release(self.allocator);
-                        }
-                    },
-                    .insert => |ins| {
-                        if (comptime stable_policy == .stable_lru) {
-                            if (self.isCurrentLiveItem(ins.item)) {
-                                const window_percent = self.cache.config.stable_lru_window_percent;
-                                const protected_percent = self.cache.config.stable_lru_protected_percent;
+                        },
+                        .insert => |ins| {
+                            if (comptime stable_policy == .stable_lru) {
+                                if (self.isCurrentLiveItem(ins.item)) {
+                                    const window_percent = self.cache.config.stable_lru_window_percent;
+                                    const protected_percent = self.cache.config.stable_lru_protected_percent;
 
-                                blk: {
-                                    self.lru.upsert(
-                                        self.allocator,
-                                        ins.item,
-                                        self.cache.config.max_weight,
-                                        window_percent,
-                                        protected_percent,
-                                    ) catch {
-                                        ins.item.release(self.allocator);
-                                        break :blk;
-                                    };
+                                    blk: {
+                                        self.lru.upsert(
+                                            self.allocator,
+                                            ins.item,
+                                            self.cache.config.max_weight,
+                                            window_percent,
+                                            protected_percent,
+                                        ) catch {
+                                            ins.item.release(self.allocator);
+                                            break :blk;
+                                        };
 
-                                    self.ensureWindowLimit();
+                                        self.ensureWindowLimit();
+                                    }
+                                } else {
+                                    self.reconcileStableLruKey(ins.item.key);
+                                    ins.item.release(self.allocator);
                                 }
                             } else {
-                                self.reconcileStableLruKey(ins.item.key);
-                                ins.item.release(self.allocator);
-                            }
-                        } else {
-                            if (!self.isCurrentLiveItem(ins.item)) {
-                                ins.item.release(self.allocator);
-                            } else {
-                                const keep = if (self.cache.config.enable_tiny_lfu and !ins.replaced)
-                                    self.applyTinyLfuAdmissionStableLhd(ins.item)
-                                else
-                                    true;
+                                if (!self.isCurrentLiveItem(ins.item)) {
+                                    ins.item.release(self.allocator);
+                                } else {
+                                    const keep = if (self.cache.config.enable_tiny_lfu and !ins.replaced)
+                                        self.applyTinyLfuAdmissionStableLhd(ins.item)
+                                    else
+                                        true;
 
-                                _ = keep;
-                                ins.item.release(self.allocator);
+                                    _ = keep;
+                                    ins.item.release(self.allocator);
+                                }
                             }
-                        }
-                    },
-                    .delete => |it| {
-                        if (comptime stable_policy == .stable_lru) {
-                            self.lru.removeIfSame(self.allocator, it);
-                            self.reconcileStableLruKey(it.key);
-                        }
-                        it.release(self.allocator);
-                    },
-                    .evict => |ack| {
-                        run_evict = false;
-                        self.evictIfNeeded();
-                        ack.set();
-                    },
-                    .clear => |ack| {
-                        if (comptime stable_policy == .stable_lru) {
-                            self.lru.clear(self.allocator);
-                        }
-                        ack.set();
-                    },
-                    .sync => |ack| {
-                        run_evict = false;
-                        ack.set();
-                    },
+                        },
+                        .delete => |it| {
+                            if (comptime stable_policy == .stable_lru) {
+                                self.lru.removeIfSame(self.allocator, it);
+                                self.reconcileStableLruKey(it.key);
+                            }
+                            it.release(self.allocator);
+                        },
+                        .evict => |ack| {
+                            run_evict = false;
+                            self.evictIfNeeded();
+                            ack.set();
+                        },
+                        .clear => |ack| {
+                            if (comptime stable_policy == .stable_lru) {
+                                self.lru.clear(self.allocator);
+                            }
+                            ack.set();
+                        },
+                        .sync => |ack| {
+                            run_evict = false;
+                            ack.set();
+                        },
+                    }
+
+                    batch_run_evict = batch_run_evict or run_evict;
                 }
 
-                if (run_evict) {
+                if (batch_run_evict) {
                     self.evictIfNeeded();
                 }
             }
@@ -564,7 +583,8 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
         fn isCurrentLiveItem(self: *Self, item: *Item) bool {
             if (!item.isLive()) return false;
 
-            const shard = &self.cache.shards[shardIndex(self.cache.ctx.hash(item.key), self.cache.shard_mask)];
+            const key_hash = self.cache.ctx.hash(item.key);
+            const shard = self.cache.shardForHash(key_hash);
             shard.lock.lockShared();
             defer shard.lock.unlockShared();
 
@@ -573,7 +593,8 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
         }
 
         fn currentLiveItemForKey(self: *Self, key: K) ?*Item {
-            const shard = &self.cache.shards[shardIndex(self.cache.ctx.hash(key), self.cache.shard_mask)];
+            const key_hash = self.cache.ctx.hash(key);
+            const shard = self.cache.shardForHash(key_hash);
             shard.lock.lockShared();
             defer shard.lock.unlockShared();
 
@@ -597,7 +618,8 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
         fn evictItemFromCache(self: *Self, item: *Item) void {
             item.markDead();
 
-            const shard = &self.cache.shards[shardIndex(self.cache.ctx.hash(item.key), self.cache.shard_mask)];
+            const key_hash = self.cache.ctx.hash(item.key);
+            const shard = self.cache.shardForHash(key_hash);
             if (shard.deleteIfSame(self.allocator, item.key, item, &self.cache.total_weight)) |removed| {
                 removed.release(self.allocator);
             }
@@ -641,15 +663,14 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
                 return;
             }
 
-            self.cache.sketch_lock.lock();
-            const candidate_freq: u32 = self.cache.frequency_sketch.frequency(self.cache.ctx.hash(candidate.key));
-            self.cache.sketch_lock.unlock();
+            const candidate_freq = self.cache.sketchFrequency(self.cache.ctx.hash(candidate.key));
 
             const required_weight = candidate_weight -| available;
 
-            const max_victims: usize = 8;
-            var victim_buf: [max_victims]*StableSlru.Entry = undefined;
-            var victims = std.ArrayListUnmanaged(*StableSlru.Entry).initBuffer(victim_buf[0..]);
+            const victim_buf_cap: usize = 64;
+            var victim_buf: [victim_buf_cap]*StableSlru.Entry = undefined;
+            const max_victims = @min(self.cache.config.eviction_batch_size, victim_buf_cap);
+            var victims = std.ArrayListUnmanaged(*StableSlru.Entry).initBuffer(victim_buf[0..max_victims]);
 
             var victims_weight: usize = 0;
             var victims_freq: u32 = 0;
@@ -657,9 +678,7 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
             while (victims_weight < required_weight and victims_freq <= candidate_freq and victims.items.len < max_victims) {
                 const victim: *StableSlru.Entry = self.lru.popProbationLruEntry() orelse break;
 
-                self.cache.sketch_lock.lock();
-                const freq: u32 = self.cache.frequency_sketch.frequency(self.cache.ctx.hash(victim.key));
-                self.cache.sketch_lock.unlock();
+                const freq = self.cache.sketchFrequency(self.cache.ctx.hash(victim.key));
 
                 victims.appendBounded(victim) catch {
                     self.lru.probation.append(&victim.node);
@@ -707,31 +726,28 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
                 return false;
             }
 
-            self.cache.sketch_lock.lock();
-            const candidate_freq: u32 = self.cache.frequency_sketch.frequency(self.cache.ctx.hash(candidate.key));
-            self.cache.sketch_lock.unlock();
+            const candidate_freq = self.cache.sketchFrequency(self.cache.ctx.hash(candidate.key));
 
-            const max_victims: usize = 8;
-            var victim_buf: [max_victims]*Item = undefined;
-            var victims = std.ArrayListUnmanaged(*Item).initBuffer(victim_buf[0..]);
+            const victim_buf_cap: usize = 64;
+            var victim_buf: [victim_buf_cap]*Item = undefined;
+            const max_victims = @min(self.cache.config.eviction_batch_size, victim_buf_cap);
+            var victims = std.ArrayListUnmanaged(*Item).initBuffer(victim_buf[0..max_victims]);
 
             var victims_weight: usize = 0;
             var victims_freq: u32 = 0;
 
             var attempts: usize = 0;
-            const max_attempts = @max(self.cache.config.items_to_prune, 1) * 4;
+            const max_attempts = @max(self.cache.config.items_to_prune, 1) * self.cache.config.admission_victim_attempt_factor;
 
             while (victims_weight < candidate_weight and victims_freq <= candidate_freq and victims.items.len < max_victims and attempts < max_attempts) : (attempts += 1) {
-                const victim = self.cache.scanLeastHitDense(self.allocator) orelse break;
+                const victim = self.cache.pickEvictionCandidate(self.allocator) orelse break;
 
                 if (victim == candidate or CacheT.containsItem(victims.items, victim)) {
                     victim.release(self.allocator);
                     continue;
                 }
 
-                self.cache.sketch_lock.lock();
-                const freq: u32 = self.cache.frequency_sketch.frequency(self.cache.ctx.hash(victim.key));
-                self.cache.sketch_lock.unlock();
+                const freq = self.cache.sketchFrequency(self.cache.ctx.hash(victim.key));
 
                 victims.appendBounded(victim) catch {
                     victim.release(self.allocator);
@@ -765,17 +781,19 @@ fn StableWorker(comptime CacheT: type, comptime stable_policy: Policy) type {
 
                     pop.item.markDead();
 
-                    const shard = &self.cache.shards[shardIndex(self.cache.ctx.hash(pop.key), self.cache.shard_mask)];
+                    const key_hash = self.cache.ctx.hash(pop.key);
+                    const shard = self.cache.shardForHash(key_hash);
                     if (shard.deleteIfSame(self.allocator, pop.key, pop.item, &self.cache.total_weight)) |removed| {
                         removed.release(self.allocator);
                     }
                 } else {
-                    const candidate = self.cache.scanLeastHitDense(self.allocator) orelse return;
+                    const candidate = self.cache.pickEvictionCandidate(self.allocator) orelse return;
                     defer candidate.release(self.allocator);
 
                     candidate.markDead();
 
-                    const shard = &self.cache.shards[shardIndex(self.cache.ctx.hash(candidate.key), self.cache.shard_mask)];
+                    const key_hash = self.cache.ctx.hash(candidate.key);
+                    const shard = self.cache.shardForHash(key_hash);
                     if (shard.deleteIfSame(self.allocator, candidate.key, candidate, &self.cache.total_weight)) |removed| {
                         removed.release(self.allocator);
                     }
@@ -798,9 +816,17 @@ pub fn CacheUnmanaged(
 
     const ItemT = ItemMod.Item(K, V, KeyOps);
     const ShardT = ShardMod.Shard(K, *ItemT, Context);
+    const max_sketch_stripes: usize = 64;
+    const max_victim_batch: usize = 64;
+    const min_small_cache_sample_budget: usize = 8;
 
     return struct {
         const Worker = if (policy.isStable()) StableWorker(@This(), policy) else void;
+        const SketchStripe = struct {
+            _: void align(std.atomic.cache_line) = {},
+            lock: std.Thread.Mutex = .{},
+            frequency_sketch: FrequencySketch = .{},
+        };
 
         config: Config,
         weigher: Weigher,
@@ -812,8 +838,8 @@ pub fn CacheUnmanaged(
         total_weight: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
         rng_state: std.atomic.Value(u64) = std.atomic.Value(u64).init(0x9e3779b97f4a7c15),
 
-        sketch_lock: std.Thread.Mutex = .{},
-        frequency_sketch: FrequencySketch = .{},
+        sketch_stripes: []SketchStripe = &[_]SketchStripe{},
+        sketch_mask: usize = 0,
 
         worker: if (policy.isStable()) ?*Worker else void = if (policy.isStable()) null else {},
         worker_lock: if (policy.isStable()) std.Thread.Mutex else void = if (policy.isStable()) .{} else {},
@@ -839,7 +865,29 @@ pub fn CacheUnmanaged(
             errdefer out.deinit(allocator);
 
             if (cfg.enable_tiny_lfu) {
-                try out.frequency_sketch.ensureCapacity(allocator, cfg.max_weight, cfg.tiny_lfu_sample_scale);
+                const auto_count = @max(
+                    std.math.ceilPowerOfTwoAssert(usize, @min(cfg.shard_count, max_sketch_stripes)),
+                    1,
+                );
+                const requested = if (cfg.sketch_stripe_count == 0)
+                    auto_count
+                else
+                    @max(
+                        std.math.ceilPowerOfTwoAssert(usize, @min(cfg.sketch_stripe_count, max_sketch_stripes)),
+                        1,
+                    );
+                const stripe_count = @min(requested, max_sketch_stripes);
+                out.sketch_stripes = try allocator.alloc(SketchStripe, stripe_count);
+                for (out.sketch_stripes) |*stripe| stripe.* = .{};
+
+                const per_stripe_cap = @max(
+                    std.math.divCeil(usize, cfg.max_weight, stripe_count) catch cfg.max_weight,
+                    1,
+                );
+                for (out.sketch_stripes) |*stripe| {
+                    try stripe.frequency_sketch.ensureCapacity(allocator, per_stripe_cap, cfg.tiny_lfu_sample_scale);
+                }
+                out.sketch_mask = stripe_count - 1;
             }
 
             return out;
@@ -855,7 +903,12 @@ pub fn CacheUnmanaged(
                 if (worker) |w| w.deinit();
             }
 
-            self.frequency_sketch.deinit(allocator);
+            for (self.sketch_stripes) |*stripe| {
+                stripe.frequency_sketch.deinit(allocator);
+            }
+            if (self.sketch_stripes.len > 0) {
+                allocator.free(self.sketch_stripes);
+            }
 
             for (self.shards) |*shard| {
                 shard.lock.lock();
@@ -873,13 +926,12 @@ pub fn CacheUnmanaged(
         }
 
         pub fn get(self: *@This(), allocator: std.mem.Allocator, key: K) ?ItemRef {
+            const key_hash = self.ctx.hash(key);
             if (self.config.enable_tiny_lfu) {
-                self.sketch_lock.lock();
-                self.frequency_sketch.increment(self.ctx.hash(key));
-                self.sketch_lock.unlock();
+                self.incrementSketch(key_hash);
             }
 
-            const shard = &self.shards[shardIndex(self.ctx.hash(key), self.shard_mask)];
+            const shard = self.shardForHash(key_hash);
             const item = shard.get(key) orelse return null;
 
             if (self.config.treat_expired_as_miss and item.isExpired()) {
@@ -900,7 +952,8 @@ pub fn CacheUnmanaged(
         }
 
         pub fn peek(self: *@This(), allocator: std.mem.Allocator, key: K) ?ItemRef {
-            const shard = &self.shards[shardIndex(self.ctx.hash(key), self.shard_mask)];
+            const key_hash = self.ctx.hash(key);
+            const shard = self.shardForHash(key_hash);
             const item = shard.get(key) orelse return null;
 
             if (self.config.treat_expired_as_miss and item.isExpired()) {
@@ -913,6 +966,7 @@ pub fn CacheUnmanaged(
 
         pub fn set(self: *@This(), allocator: std.mem.Allocator, key: K, value: V, ttl_ns: u64) !SetResult {
             const worker = if (comptime policy.isStable()) try self.ensureWorkerStarted(allocator) else {};
+            const key_hash = self.ctx.hash(key);
 
             const weight = self.weigh(key, &value);
             const item = try ItemT.create(allocator, key, value, ttl_ns, weight);
@@ -923,7 +977,7 @@ pub fn CacheUnmanaged(
             // Shard owns one ref.
             item.retain();
 
-            const shard = &self.shards[shardIndex(self.ctx.hash(item.key), self.shard_mask)];
+            const shard = self.shardForHash(key_hash);
             const old = try shard.set(allocator, item.key, item, &self.total_weight);
             const replaced = old != null;
             if (old) |old_item| {
@@ -936,8 +990,7 @@ pub fn CacheUnmanaged(
                 worker.enqueueEvict();
             } else {
                 if (self.config.enable_tiny_lfu and !replaced) {
-                    const candidate_hash = self.ctx.hash(item.key);
-                    _ = self.applyTinyLfuAdmission(allocator, item, candidate_hash);
+                    _ = self.applyTinyLfuAdmission(allocator, item, key_hash);
                 }
                 try self.evictIfNeeded(allocator);
             }
@@ -963,7 +1016,8 @@ pub fn CacheUnmanaged(
         }
 
         pub fn delete(self: *@This(), allocator: std.mem.Allocator, key: K) ?ItemRef {
-            const shard = &self.shards[shardIndex(self.ctx.hash(key), self.shard_mask)];
+            const key_hash = self.ctx.hash(key);
+            const shard = self.shardForHash(key_hash);
             const item = shard.delete(allocator, key, &self.total_weight) orelse return null;
 
             if (comptime policy.isStable()) {
@@ -989,13 +1043,12 @@ pub fn CacheUnmanaged(
             }
             self.total_weight.store(0, .release);
 
-            self.sketch_lock.lock();
-            defer self.sketch_lock.unlock();
-
             if (self.config.enable_tiny_lfu) {
-                self.frequency_sketch.clear();
-            } else {
-                self.frequency_sketch.deinit(allocator);
+                for (self.sketch_stripes) |*stripe| {
+                    stripe.lock.lock();
+                    stripe.frequency_sketch.clear();
+                    stripe.lock.unlock();
+                }
             }
         }
 
@@ -1034,7 +1087,8 @@ pub fn CacheUnmanaged(
         }
 
         fn peekRaw(self: *@This(), key: K) ?ItemRef {
-            const shard = &self.shards[shardIndex(self.ctx.hash(key), self.shard_mask)];
+            const key_hash = self.ctx.hash(key);
+            const shard = self.shardForHash(key_hash);
             const item = shard.get(key) orelse return null;
             return .{ .item = item };
         }
@@ -1042,7 +1096,8 @@ pub fn CacheUnmanaged(
         fn isCurrentItem(self: *@This(), item: *ItemT) bool {
             if (!item.isLive()) return false;
 
-            const shard = &self.shards[shardIndex(self.ctx.hash(item.key), self.shard_mask)];
+            const item_hash = self.ctx.hash(item.key);
+            const shard = self.shardForHash(item_hash);
             shard.lock.lockShared();
             defer shard.lock.unlockShared();
 
@@ -1302,26 +1357,57 @@ pub fn CacheUnmanaged(
             return x;
         }
 
-        fn pickEvictionCandidate(self: *@This(), allocator: std.mem.Allocator) ?*ItemT {
-            if (self.len() <= self.config.sample_size) {
-                return if (comptime policy.isLhd())
-                    self.scanLeastHitDense(allocator)
-                else
-                    self.scanOldest(allocator);
-            }
-
-            return if (comptime policy.isLhd())
-                (self.pickSampledLhd(allocator) orelse self.scanLeastHitDense(allocator))
-            else
-                (self.pickSampledLru(allocator) orelse self.scanOldest(allocator));
+        fn shardForHash(self: *@This(), hash: u64) *ShardT {
+            return &self.shards[shardIndex(hash, self.shard_mask)];
         }
 
-        fn pickSampledLru(self: *@This(), allocator: std.mem.Allocator) ?*ItemT {
+        fn sketchStripeForHash(self: *@This(), hash: u64) *SketchStripe {
+            std.debug.assert(self.sketch_stripes.len > 0);
+            return &self.sketch_stripes[shardIndex(hash, self.sketch_mask)];
+        }
+
+        fn incrementSketch(self: *@This(), hash: u64) void {
+            if (!self.config.enable_tiny_lfu) return;
+            const stripe = self.sketchStripeForHash(hash);
+            stripe.lock.lock();
+            stripe.frequency_sketch.increment(hash);
+            stripe.lock.unlock();
+        }
+
+        fn sketchFrequency(self: *@This(), hash: u64) u32 {
+            if (!self.config.enable_tiny_lfu) return 0;
+            const stripe = self.sketchStripeForHash(hash);
+            stripe.lock.lock();
+            const freq: u32 = stripe.frequency_sketch.frequency(hash);
+            stripe.lock.unlock();
+            return freq;
+        }
+
+        fn pickEvictionCandidate(self: *@This(), allocator: std.mem.Allocator) ?*ItemT {
+            const sample_budget = self.evictionSampleBudget();
+            return if (comptime policy.isLhd())
+                self.pickSampledLhdWithBudget(allocator, sample_budget)
+            else
+                self.pickSampledLruWithBudget(allocator, sample_budget);
+        }
+
+        fn evictionSampleBudget(self: *@This()) usize {
+            const base = @max(self.config.sample_size, 1);
+            if (self.itemCount() <= base) {
+                return @max(
+                    base *| self.config.eviction_sampling_factor_small_cache,
+                    min_small_cache_sample_budget,
+                );
+            }
+            return base;
+        }
+
+        fn pickSampledLruWithBudget(self: *@This(), allocator: std.mem.Allocator, sample_budget: usize) ?*ItemT {
             var best: ?*Item = null;
             var best_tick: u64 = std.math.maxInt(u64);
 
             var i: usize = 0;
-            while (i < self.config.sample_size) : (i += 1) {
+            while (i < sample_budget) : (i += 1) {
                 const shard = &self.shards[self.nextRand() % self.shards.len];
                 const item = shard.sampleAtRetained(@intCast(self.nextRand())) orelse continue;
 
@@ -1338,34 +1424,13 @@ pub fn CacheUnmanaged(
             return best;
         }
 
-        fn scanOldest(self: *@This(), allocator: std.mem.Allocator) ?*ItemT {
-            var best: ?*Item = null;
-            var best_tick: u64 = std.math.maxInt(u64);
-
-            for (self.shards) |*shard| {
-                shard.lock.lockShared();
-                for (shard.items.items) |item| {
-                    const tick = item.lastAccessTick();
-                    if (best == null or tick < best_tick) {
-                        item.retain();
-                        if (best) |b| b.release(allocator);
-                        best = item;
-                        best_tick = tick;
-                    }
-                }
-                shard.lock.unlockShared();
-            }
-
-            return best;
-        }
-
-        fn pickSampledLhd(self: *@This(), allocator: std.mem.Allocator) ?*ItemT {
+        fn pickSampledLhdWithBudget(self: *@This(), allocator: std.mem.Allocator, sample_budget: usize) ?*ItemT {
             const now_tick = @max(self.access_clock.load(.acquire), 1);
 
             var best: ?*Item = null;
 
             var i: usize = 0;
-            while (i < self.config.sample_size) : (i += 1) {
+            while (i < sample_budget) : (i += 1) {
                 const shard = &self.shards[self.nextRand() % self.shards.len];
                 const item = shard.sampleAtRetained(@intCast(self.nextRand())) orelse continue;
 
@@ -1375,25 +1440,6 @@ pub fn CacheUnmanaged(
                 } else {
                     item.release(allocator);
                 }
-            }
-
-            return best;
-        }
-
-        fn scanLeastHitDense(self: *@This(), allocator: std.mem.Allocator) ?*ItemT {
-            const now_tick = @max(self.access_clock.load(.acquire), 1);
-            var best: ?*Item = null;
-
-            for (self.shards) |*shard| {
-                shard.lock.lockShared();
-                for (shard.items.items) |item| {
-                    if (best == null or self.lhdIsBetterCandidate(item, best.?, now_tick)) {
-                        item.retain();
-                        if (best) |b| b.release(allocator);
-                        best = item;
-                    }
-                }
-                shard.lock.unlockShared();
             }
 
             return best;
@@ -1436,19 +1482,17 @@ pub fn CacheUnmanaged(
                 return false;
             }
 
-            self.sketch_lock.lock();
-            const candidate_freq: u32 = self.frequency_sketch.frequency(candidate_hash);
-            self.sketch_lock.unlock();
+            const candidate_freq = self.sketchFrequency(candidate_hash);
 
-            const max_victims: usize = 8;
-            var victim_buf: [max_victims]*ItemT = undefined;
-            var victims = std.ArrayListUnmanaged(*ItemT).initBuffer(victim_buf[0..]);
+            var victim_buf: [max_victim_batch]*ItemT = undefined;
+            const max_victims = @min(self.config.eviction_batch_size, max_victim_batch);
+            var victims = std.ArrayListUnmanaged(*ItemT).initBuffer(victim_buf[0..max_victims]);
 
             var victims_weight: usize = 0;
             var victims_freq: u32 = 0;
 
             var attempts: usize = 0;
-            const max_attempts = @max(self.config.items_to_prune, 1) * 4;
+            const max_attempts = @max(self.config.items_to_prune, 1) * self.config.admission_victim_attempt_factor;
 
             while (victims_weight < candidate_weight and victims_freq <= candidate_freq and victims.items.len < max_victims and attempts < max_attempts) : (attempts += 1) {
                 const victim = self.pickEvictionCandidate(allocator) orelse break;
@@ -1458,9 +1502,7 @@ pub fn CacheUnmanaged(
                     continue;
                 }
 
-                self.sketch_lock.lock();
-                const freq: u32 = self.frequency_sketch.frequency(self.ctx.hash(victim.key));
-                self.sketch_lock.unlock();
+                const freq = self.sketchFrequency(self.ctx.hash(victim.key));
 
                 victims.appendBounded(victim) catch {
                     victim.release(allocator);
@@ -1485,7 +1527,8 @@ pub fn CacheUnmanaged(
         fn evictCandidate(self: *@This(), allocator: std.mem.Allocator, candidate: *ItemT) void {
             candidate.markDead();
 
-            const shard = &self.shards[shardIndex(self.ctx.hash(candidate.key), self.shard_mask)];
+            const key_hash = self.ctx.hash(candidate.key);
+            const shard = self.shardForHash(key_hash);
             if (shard.deleteIfSame(allocator, candidate.key, candidate, &self.total_weight)) |removed| {
                 removed.release(allocator);
             }
@@ -1495,7 +1538,8 @@ pub fn CacheUnmanaged(
             for (victims) |victim| {
                 victim.markDead();
 
-                const shard = &self.shards[shardIndex(self.ctx.hash(victim.key), self.shard_mask)];
+                const key_hash = self.ctx.hash(victim.key);
+                const shard = self.shardForHash(key_hash);
                 if (shard.deleteIfSame(allocator, victim.key, victim, &self.total_weight)) |removed| {
                     removed.release(allocator);
                 }
@@ -1519,7 +1563,8 @@ pub fn CacheUnmanaged(
 
                 candidate.markDead();
 
-                const shard = &self.shards[shardIndex(self.ctx.hash(candidate.key), self.shard_mask)];
+                const key_hash = self.ctx.hash(candidate.key);
+                const shard = self.shardForHash(key_hash);
                 if (shard.deleteIfSame(allocator, candidate.key, candidate, &self.total_weight)) |removed| {
                     removed.release(allocator);
                 }

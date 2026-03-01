@@ -649,3 +649,83 @@ test "filter OOM releases retained refs" {
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 1 });
     try std.testing.expectError(error.OutOfMemory, cache.filter(failing.allocator(), PredCtx, .{}));
 }
+
+test "config normalizes performance tuning knobs" {
+    const cfg = try (Config{
+        .shard_count = 8,
+        .sketch_stripe_count = 999,
+        .eviction_sampling_factor_small_cache = 0,
+        .eviction_batch_size = 0,
+        .admission_victim_attempt_factor = 0,
+    }).build();
+
+    try std.testing.expectEqual(@as(usize, 64), cfg.sketch_stripe_count);
+    try std.testing.expectEqual(@as(usize, 1), cfg.eviction_sampling_factor_small_cache);
+    try std.testing.expectEqual(@as(usize, 1), cfg.eviction_batch_size);
+    try std.testing.expectEqual(@as(usize, 1), cfg.admission_victim_attempt_factor);
+}
+
+test "concurrent set/delete same key stays bounded" {
+    const alloc = std.testing.allocator;
+    var cache = try SampledLruCache(Key, u64).init(alloc, Config{
+        .shard_count = 4,
+        .max_weight = 4_096,
+        .enable_tiny_lfu = false,
+    });
+    defer cache.deinit();
+
+    const WorkerCtx = struct {
+        cache: *SampledLruCache(Key, u64),
+        iterations: usize,
+        seed: u64,
+    };
+
+    const Worker = struct {
+        fn run(ctx: *WorkerCtx) void {
+            var state = ctx.seed;
+            var i: usize = 0;
+            while (i < ctx.iterations) : (i += 1) {
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                state *%= 0x2545_F491_4F6C_DD1D;
+
+                if ((state & 1) == 0) {
+                    var set_result = ctx.cache.set("hot", state, 0) catch continue;
+                    set_result.deinit();
+                } else if (ctx.cache.delete("hot")) |item| {
+                    item.deinit();
+                }
+
+                if (i % 8 == 0) {
+                    if (ctx.cache.get("hot")) |item| {
+                        item.deinit();
+                    }
+                }
+            }
+        }
+    };
+
+    const thread_count: usize = 8;
+    const iterations_per_thread: usize = 10_000;
+    var contexts: [thread_count]WorkerCtx = undefined;
+    var workers: [thread_count]std.Thread = undefined;
+
+    var t: usize = 0;
+    while (t < thread_count) : (t += 1) {
+        contexts[t] = .{
+            .cache = &cache,
+            .iterations = iterations_per_thread,
+            .seed = 0x9e37_79b9_7f4a_7c15 +% @as(u64, @intCast(t * 97 + 1)),
+        };
+        workers[t] = try std.Thread.spawn(.{}, Worker.run, .{&contexts[t]});
+    }
+
+    for (workers) |th| th.join();
+    cache.sync();
+
+    try std.testing.expect(cache.len() <= 1);
+    if (cache.peek("hot")) |item| {
+        item.deinit();
+    }
+}

@@ -1,0 +1,31 @@
+Async runtime: Tokio
+Config { trace_file: S3, ttl: None, tti: None, num_clients: Some([1, 4, 16]), repeat: None, insertion_delay: None, insert_once: false, invalidate: false, invalidate_all: false, invalidate_entries_if: false, iterate: false, eviction_listener: None, size_aware: false, entry_api: false, per_key_expiration: false }
+
+Cache, Max Capacity, Clients, Inserts, Reads, Hit Ratio, Duration Secs
+Moka Sync Cache, 100000, 1, 14694850, 16407702, 10.439, 9.427
+Moka Sync Cache, 100000, 4, 14695773, 16407702, 10.434, 7.996
+Moka Sync Cache, 100000, 16, 14702834, 16407702, 10.391, 12.852
+Moka Async Cache, 100000, 1, 14694850, 16407702, 10.439, 12.016
+Moka Async Cache, 100000, 4, 14683739, 16407702, 10.507, 10.918
+Moka Async Cache, 100000, 16, 14690470, 16407702, 10.466, 12.484
+Moka SegmentedCache(8), 100000, 1, 14756139, 16407702, 10.066, 10.760
+Moka SegmentedCache(8), 100000, 4, 14754312, 16407702, 10.077, 6.948
+Moka SegmentedCache(8), 100000, 16, 14752847, 16407702, 10.086, 4.955
+Moka Sync Cache, 400000, 1, 9439274, 16407702, 42.470, 11.945
+Moka Sync Cache, 400000, 4, 9501871, 16407702, 42.089, 7.626
+Moka Sync Cache, 400000, 16, 9699816, 16407702, 40.883, 9.977
+Moka Async Cache, 400000, 1, 9439274, 16407702, 42.470, 13.988
+Moka Async Cache, 400000, 4, 9425427, 16407702, 42.555, 10.310
+Moka Async Cache, 400000, 16, 9631648, 16407702, 41.298, 10.130
+Moka SegmentedCache(8), 400000, 1, 9459064, 16407702, 42.350, 13.626
+Moka SegmentedCache(8), 400000, 4, 9461338, 16407702, 42.336, 7.100
+Moka SegmentedCache(8), 400000, 16, 9460242, 16407702, 42.343, 4.606
+Moka Sync Cache, 800000, 1, 4868066, 16407702, 70.331, 9.508
+Moka Sync Cache, 800000, 4, 5033189, 16407702, 69.324, 4.925
+Moka Sync Cache, 800000, 16, 5523725, 16407702, 66.335, 5.581
+Moka Async Cache, 800000, 1, 4868066, 16407702, 70.331, 10.835
+Moka Async Cache, 800000, 4, 4880464, 16407702, 70.255, 6.611
+Moka Async Cache, 800000, 16, 5363976, 16407702, 67.308, 5.849
+Moka SegmentedCache(8), 800000, 1, 4870652, 16407702, 70.315, 10.635
+Moka SegmentedCache(8), 800000, 4, 4868377, 16407702, 70.329, 4.870
+Moka SegmentedCache(8), 800000, 16, 4881736, 16407702, 70.247, 2.964

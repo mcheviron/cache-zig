@@ -1,0 +1,40 @@
+Async runtime: Tokio
+Config { trace_file: Oltp, ttl: None, tti: None, num_clients: Some([1, 4, 16]), repeat: None, insertion_delay: None, insert_once: false, invalidate: false, invalidate_all: false, invalidate_entries_if: false, iterate: false, eviction_listener: None, size_aware: false, entry_api: false, per_key_expiration: false }
+
+Cache, Max Capacity, Clients, Inserts, Reads, Hit Ratio, Duration Secs
+Moka Sync Cache, 256, 1, 703040, 914145, 23.093, 0.296
+Moka Sync Cache, 256, 4, 645868, 914145, 29.347, 0.309
+Moka Sync Cache, 256, 16, 673877, 914145, 26.283, 0.618
+Moka Async Cache, 256, 1, 703040, 914145, 23.093, 0.403
+Moka Async Cache, 256, 4, 703199, 914145, 23.076, 0.404
+Moka Async Cache, 256, 16, 683477, 914145, 25.233, 0.559
+Moka SegmentedCache(8), 256, 1, 621315, 914145, 32.033, 0.294
+Moka SegmentedCache(8), 256, 4, 636228, 914145, 30.402, 0.275
+Moka SegmentedCache(8), 256, 16, 654960, 914145, 28.353, 0.271
+Moka Sync Cache, 512, 1, 640117, 914145, 29.976, 0.300
+Moka Sync Cache, 512, 4, 588458, 914145, 35.627, 0.257
+Moka Sync Cache, 512, 16, 616470, 914145, 32.563, 0.573
+Moka Async Cache, 512, 1, 640117, 914145, 29.976, 0.406
+Moka Async Cache, 512, 4, 640997, 914145, 29.880, 0.346
+Moka Async Cache, 512, 16, 622565, 914145, 31.896, 0.501
+Moka SegmentedCache(8), 512, 1, 579784, 914145, 36.576, 0.278
+Moka SegmentedCache(8), 512, 4, 593569, 914145, 35.068, 0.241
+Moka SegmentedCache(8), 512, 16, 611941, 914145, 33.059, 0.245
+Moka Sync Cache, 1000, 1, 586961, 914145, 35.791, 0.279
+Moka Sync Cache, 1000, 4, 538828, 914145, 41.057, 0.233
+Moka Sync Cache, 1000, 16, 566885, 914145, 37.987, 0.543
+Moka Async Cache, 1000, 1, 586961, 914145, 35.791, 0.373
+Moka Async Cache, 1000, 4, 588704, 914145, 35.601, 0.307
+Moka Async Cache, 1000, 16, 572298, 914145, 37.395, 0.488
+Moka SegmentedCache(8), 1000, 1, 544208, 914145, 40.468, 0.282
+Moka SegmentedCache(8), 1000, 4, 556895, 914145, 39.080, 0.217
+Moka SegmentedCache(8), 1000, 16, 572804, 914145, 37.340, 0.230
+Moka Sync Cache, 2000, 1, 537324, 914145, 41.221, 0.263
+Moka Sync Cache, 2000, 4, 497336, 914145, 45.596, 0.209
+Moka Sync Cache, 2000, 16, 522896, 914145, 42.799, 0.495
+Moka Async Cache, 2000, 1, 537324, 914145, 41.221, 0.353
+Moka Async Cache, 2000, 4, 537115, 914145, 41.244, 0.283
+Moka Async Cache, 2000, 16, 526682, 914145, 42.385, 0.435
+Moka SegmentedCache(8), 2000, 1, 498102, 914145, 45.512, 0.268
+Moka SegmentedCache(8), 2000, 4, 509962, 914145, 44.214, 0.185
+Moka SegmentedCache(8), 2000, 16, 524211, 914145, 42.656, 0.195

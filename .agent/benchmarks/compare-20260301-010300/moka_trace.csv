@@ -1,0 +1,19 @@
+trace,cache,capacity,clients,reads,hit_ratio_pct,duration_secs
+s3,Moka Sync Cache,100000,1,16407702,10.439,8.620
+s3,Moka Sync Cache,100000,4,16407702,10.504,8.695
+s3,Moka Sync Cache,100000,16,16407702,10.387,12.848
+s3,Moka SegmentedCache(8),100000,1,16407702,10.066,10.308
+s3,Moka SegmentedCache(8),100000,4,16407702,10.057,6.323
+s3,Moka SegmentedCache(8),100000,16,16407702,10.097,4.903
+s3,Moka Sync Cache,400000,1,16407702,42.470,11.301
+s3,Moka Sync Cache,400000,4,16407702,42.134,7.360
+s3,Moka Sync Cache,400000,16,16407702,40.954,9.961
+s3,Moka SegmentedCache(8),400000,1,16407702,42.350,13.310
+s3,Moka SegmentedCache(8),400000,4,16407702,42.311,6.835
+s3,Moka SegmentedCache(8),400000,16,16407702,42.342,4.685
+s3,Moka Sync Cache,800000,1,16407702,70.331,9.059
+s3,Moka Sync Cache,800000,4,16407702,70.079,4.330
+s3,Moka Sync Cache,800000,16,16407702,66.323,5.445
+s3,Moka SegmentedCache(8),800000,1,16407702,70.315,10.395
+s3,Moka SegmentedCache(8),800000,4,16407702,70.313,4.730
+s3,Moka SegmentedCache(8),800000,16,16407702,70.233,2.925
